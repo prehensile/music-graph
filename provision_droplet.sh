@@ -36,6 +36,8 @@ CSV_DIR="${CSV_DIR:-$DATA_DIR/csv}"
 REPO_DIR="${REPO_DIR:-/opt/music-graph}"
 REPO_URL="${REPO_URL:-https://github.com/prehensile/music-graph.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
+# Only needed if REPO_URL is private. See fetch_repo() for the caveats.
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 # Community Edition serves exactly one user database, so import into the
 # default. Naming it anything else yields a database Neo4j will not start.
 DATABASE="${DATABASE:-neo4j}"
@@ -201,14 +203,41 @@ configure_firewall() {
 }
 
 fetch_repo() {
+    # A public repo needs no credentials. For a private one, set GITHUB_TOKEN to
+    # a fine-grained token with read-only Contents access to just this repo.
+    #
+    # The header is passed per command with -c rather than embedded in the
+    # remote URL, so it never lands in .git/config on the droplet. It is still
+    # visible in the process list while git runs, and DigitalOcean exposes
+    # user-data to anything on the box via the metadata service -- so scope the
+    # token to one repo, give it the shortest expiry you can, and revoke it once
+    # the build is done.
+    local git_auth=()
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        echo "  using GITHUB_TOKEN for a private clone"
+        git_auth=(-c "http.extraheader=Authorization: Basic $(
+            printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
+    fi
+
     if [[ -d "$REPO_DIR/.git" ]]; then
         echo "  updating repo in $REPO_DIR"
-        git -C "$REPO_DIR" fetch --quiet origin "$REPO_BRANCH"
+        git "${git_auth[@]}" -C "$REPO_DIR" fetch --quiet origin "$REPO_BRANCH"
         git -C "$REPO_DIR" checkout --quiet "$REPO_BRANCH"
         git -C "$REPO_DIR" reset --hard --quiet "origin/$REPO_BRANCH"
     else
         echo "  cloning $REPO_URL"
-        git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
+        if ! git "${git_auth[@]}" clone --quiet --branch "$REPO_BRANCH" \
+                "$REPO_URL" "$REPO_DIR"; then
+            echo "  clone failed." >&2
+            if [[ -z "$GITHUB_TOKEN" ]]; then
+                echo "  If $REPO_URL is private, either make it public or set" >&2
+                echo "  GITHUB_TOKEN to a read-only fine-grained token." >&2
+            else
+                echo "  Check the token has Contents:read on this repo and has" >&2
+                echo "  not expired, and that the branch name is right." >&2
+            fi
+            return 1
+        fi
     fi
     pip3 install --quiet --break-system-packages -r "$REPO_DIR/requirements.txt"
 

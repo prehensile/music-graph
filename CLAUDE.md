@@ -153,6 +153,12 @@ It ends by installing `music-graph.service`, a systemd unit running `server.py`,
 
 `cloud-init.example.sh` is designed to be pasted into the DigitalOcean control panel's **User data** box when creating the droplet (Advanced Options → Add Initialization scripts). Fill in three values, create the droplet, and it provisions, imports and starts serving on first boot. No SSH, no terminal at any point.
 
+### Cloning a private repo
+
+The droplet clones this repo over unauthenticated HTTPS, which only works if it is public. If it is private, set `GITHUB_TOKEN` to a fine-grained token with read-only **Contents** access to just this repo.
+
+`fetch_repo` passes it per git command via `http.extraheader` rather than embedding it in the remote URL, so it never lands in `.git/config`. It is still visible in the process list while git runs, and DigitalOcean serves user-data to anything running on the droplet, so scope the token to one repo, give it a short expiry, and revoke it when the build finishes. A failed clone says which of the two situations you are in.
+
 ### Terminal route
 
 ```bash
