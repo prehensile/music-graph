@@ -136,13 +136,28 @@ Per entity in the default route: **Artists/Groups** XML → CSV directly; **Rele
 
 ## Running it on a droplet
 
-`provision_droplet.sh` does the whole thing unattended on a fresh Ubuntu 24.04 droplet: installs Java 21, Neo4j 5 and the Python deps, downloads and verifies the dumps, runs the prefilter route, imports, and prints node/relationship counts. Every step is idempotent, so it is safe to re-run after a disconnect.
+`provision_droplet.sh` does the whole thing unattended on a fresh Ubuntu 24.04 droplet: installs Java 21, Neo4j 5 and the Python deps, downloads and verifies the dumps, runs the prefilter route, imports, and reports node/relationship counts. Every step is idempotent, so it is safe to re-run after a disconnect.
+
+### No-terminal route (works from a phone)
+
+`cloud-init.example.sh` is designed to be pasted into the DigitalOcean control panel's **User data** box when creating the droplet (Advanced Options → Add Initialization scripts). Fill in four values, create the droplet, and it provisions and imports on first boot. No SSH, no terminal at any point.
+
+Set `NTFY_TOPIC` and the run pushes a notification to your phone at every stage — via the free [ntfy](https://ntfy.sh) app, no account needed — with a loud one carrying the last dozen log lines if anything fails. Topics are public to whoever guesses the name, so make it long and random.
+
+Set `TAILSCALE_AUTHKEY` and the droplet joins your tailnet, with Neo4j bound to *the tailnet address only*. Neo4j Browser is then reachable at `http://<tailnet-ip>:7474` from your phone, with nothing exposed to the internet and no firewall rule to get wrong. `tailscale up --ssh` also means the Tailscale app gives you a shell without managing keys — the only practical SSH from a phone. Leave it empty and Neo4j stays on localhost.
+
+Progress is also written to `/var/log/music-graph.status` as a single line, so `cat` it for instant state without reading the log.
+
+### Terminal route
 
 ```bash
 export DUMP_DATE=20250801
 export NEO4J_PASSWORD='choose-something'
-nohup ./provision_droplet.sh > /var/log/music-graph.log 2>&1 &
+export NTFY_TOPIC='something-unguessable'    # optional
+./provision_droplet.sh
 ```
+
+Run interactively it tees to the terminal; unattended it redirects straight to `/var/log/music-graph.log`, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
 
 **Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Peak disk on the prefilter route is ~35 GB — 10 GB of `.gz` dumps, ~5 GB of CSVs, ~15 GB of Neo4j store — so no block-storage volume is needed. Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run that is destroyed afterward costs well under a pound. The index route would need a ~300 GB volume instead.
 
@@ -151,7 +166,7 @@ Going smaller than 8 GB is a false economy: `neo4j-admin import` gets tight on 4
 Two deployment notes baked into the script:
 
 - **It imports into the database named `neo4j`**, not `discogs`. Community Edition serves exactly one user database; importing into another name yields a database Neo4j will not start. It is also what the viewer's driver picks up by default.
-- **Bolt stays bound to localhost.** Do not open 7687/7474 to the internet. Reach it over an SSH tunnel: `ssh -N -L 7687:localhost:7687 -L 7474:localhost:7474 root@<ip>`.
+- **Nothing is exposed to the public internet.** Without Tailscale, Neo4j listens on localhost only, reachable via `ssh -N -L 7474:localhost:7474 -L 7687:localhost:7687 root@<ip>`. With Tailscale, it binds to the tailnet address alone — never `0.0.0.0`. The healthcheck polls whichever address was actually configured.
 
 ## Web Interface
 

@@ -23,6 +23,18 @@ set -euo pipefail
 DUMP_DATE="${DUMP_DATE:?set DUMP_DATE, e.g. 20250801 (see https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html)}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:?set NEO4J_PASSWORD}"
 
+# Optional, both aimed at running this without a terminal to watch:
+#   NTFY_TOPIC        push a notification at each stage to https://ntfy.sh/<topic>
+#                     Pick something unguessable -- ntfy topics are public to
+#                     anyone who knows the name.
+#   TAILSCALE_AUTHKEY join a tailnet so Neo4j Browser is reachable privately,
+#                     with no ports open to the internet.
+NTFY_TOPIC="${NTFY_TOPIC:-}"
+TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
+
+LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
+STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
+
 DUMP_YEAR="${DUMP_DATE:0:4}"
 DATA_DIR="${DATA_DIR:-/var/lib/music-graph/data}"
 CSV_DIR="${CSV_DIR:-$DATA_DIR/csv}"
@@ -34,15 +46,54 @@ REPO_BRANCH="${REPO_BRANCH:-main}"
 DATABASE="${DATABASE:-neo4j}"
 BASE_URL="https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${DUMP_YEAR}"
 
-log() { printf '\n[%s] == %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Checked before anything opens a file in /var/log, so a non-root run says why
+# rather than dying on a permission error.
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+
+# Mirror all output to LOG_FILE so a cloud-init run (where nothing is watching
+# stdout) is still debuggable, and so the failure notification can quote a tail.
+# Interactively, tee so it is visible live. Unattended, redirect straight to the
+# file: process substitution can lose buffered output when the shell exits,
+# which would truncate exactly the failure trace worth having.
+if [[ -t 1 ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+else
+    exec >> "$LOG_FILE" 2>&1
+fi
+
+notify() {
+    [[ -n "$NTFY_TOPIC" ]] || return 0
+    curl -fsS --max-time 15 \
+        -H "Title: music-graph" \
+        -H "Priority: ${2:-default}" \
+        -H "Tags: ${3:-gear}" \
+        -d "$1" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1 || true
+}
+
+# Every stage announces itself three ways: the log, a one-line status file you
+# can cat, and a phone notification.
+log() {
+    printf '\n[%s] == %s\n' "$(date -u +%H:%M:%S)" "$*"
+    printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" > "$STATUS_FILE"
+    notify "$*"
+}
+
+on_error() {
+    local rc=$? line=$1
+    printf '\n!! FAILED (exit %s) at line %s\n' "$rc" "$line"
+    printf 'FAILED (exit %s) at line %s\n' "$rc" "$line" > "$STATUS_FILE"
+    notify "FAILED at line ${line} (exit ${rc})
+
+$(tail -n 12 "$LOG_FILE" 2>/dev/null)" urgent rotating_light
+}
+trap 'on_error $LINENO' ERR
 
 # ---------------------------------------------------------------- preflight
 
 preflight() {
     log "Preflight"
-    [[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
-
     mkdir -p "$DATA_DIR" "$CSV_DIR"
 
     local avail_gb
@@ -103,6 +154,40 @@ install_neo4j() {
     systemctl stop neo4j 2>/dev/null || true
     systemctl enable neo4j >/dev/null 2>&1 || true
     neo4j-admin --version
+}
+
+install_tailscale() {
+    [[ -n "$TAILSCALE_AUTHKEY" ]] || return 0
+    if ! have tailscale; then
+        log "Installing Tailscale"
+        curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+    if ! tailscale status >/dev/null 2>&1; then
+        log "Joining tailnet"
+        # --ssh means you can also shell in from the Tailscale phone app with no
+        # keys to manage, which is the only practical SSH from a phone.
+        tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname=music-graph --ssh
+    fi
+    tailscale ip -4
+}
+
+configure_remote_access() {
+    [[ -n "$TAILSCALE_AUTHKEY" ]] || return 0
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -1) || return 0
+    [[ -n "$ts_ip" ]] || return 0
+
+    log "Binding Neo4j to the tailnet address $ts_ip"
+    # Bind to the tailnet interface specifically, never 0.0.0.0: the browser and
+    # bolt are then reachable from your own devices and from nowhere else, with
+    # no firewall rule to get wrong and no ports open to the internet.
+    local conf=/etc/neo4j/neo4j.conf
+    sed -i -E '/^(server\.default_listen_address|server\.bolt\.advertised_address|server\.http\.advertised_address)=/d' "$conf"
+    {
+        echo "server.default_listen_address=$ts_ip"
+        echo "server.bolt.advertised_address=$ts_ip:7687"
+        echo "server.http.advertised_address=$ts_ip:7474"
+    } >> "$conf"
 }
 
 fetch_repo() {
@@ -219,15 +304,26 @@ import_graph() {
     neo4j-admin dbms set-initial-password "$NEO4J_PASSWORD" 2>/dev/null \
         || echo "  password already set, leaving it alone"
 
+    configure_remote_access
+
     log "Starting Neo4j"
     systemctl start neo4j
-    local i
+
+    # Poll whichever address Neo4j was actually bound to.
+    local host="localhost" i
+    if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
+        host=$(tailscale ip -4 2>/dev/null | head -1) || host="localhost"
+        [[ -n "$host" ]] || host="localhost"
+    fi
     for i in $(seq 1 60); do
-        if curl -fsS -o /dev/null http://localhost:7474/ 2>/dev/null; then
-            echo "  up after ${i}0s"; break
+        if curl -fsS -o /dev/null "http://${host}:7474/" 2>/dev/null; then
+            echo "  up after $((i*10))s"; return 0
         fi
         sleep 10
     done
+    echo "  Neo4j did not answer on ${host}:7474 within 10 minutes" >&2
+    echo "  check: journalctl -u neo4j -n 50" >&2
+    return 1
 }
 
 verify() {
@@ -248,6 +344,7 @@ main() {
     local started=$SECONDS
     preflight
     install_packages
+    install_tailscale
     install_neo4j
     fetch_repo
     download_dumps
@@ -255,18 +352,28 @@ main() {
     import_graph
     verify
 
-    log "Done in $(( (SECONDS - started) / 60 )) minutes"
+    local mins=$(( (SECONDS - started) / 60 ))
+    local where="an SSH tunnel:  ssh -N -L 7474:localhost:7474 -L 7687:localhost:7687 root@<droplet-ip>"
+    if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
+        where="http://$(tailscale ip -4 2>/dev/null | head -1):7474 from any device on your tailnet"
+    fi
+
+    printf '\n[%s] == Done in %s minutes\n' "$(date -u +%H:%M:%S)" "$mins"
+    printf 'DONE in %s minutes\n' "$mins" > "$STATUS_FILE"
+    notify "Import finished in ${mins} minutes.
+
+Neo4j Browser: ${where}
+User: neo4j
+
+Remember to destroy the droplet when you are done -- it bills hourly." default white_check_mark
+
     cat <<EOF
 
-Bolt is bound to localhost only, which is the right default -- do not open 7687
-or 7474 to the internet. Reach it over an SSH tunnel from your machine:
+Neo4j Browser: ${where}
+Log in as 'neo4j' with the password you set.
 
-    ssh -N -L 7687:localhost:7687 -L 7474:localhost:7474 root@<droplet-ip>
-
-Then browse http://localhost:7474 (user neo4j), or serve the viewer locally:
-
-    cd web && cp config.example.js config.js   # set neo4jPassword
-    python3 -m http.server 8000
+Nothing is exposed to the public internet: without Tailscale, Neo4j listens on
+localhost only; with it, on the tailnet address alone.
 
 When you are finished, snapshot or destroy the droplet -- it bills by the hour.
 EOF
