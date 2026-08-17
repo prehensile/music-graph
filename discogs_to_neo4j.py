@@ -2,6 +2,7 @@
 
 import os
 import csv
+import gzip
 import time
 from alive_progress import alive_bar
 import traceback
@@ -276,85 +277,157 @@ def process_master( element: Element, writers, xml_files, sqlite_files ):
 
 
 
-def parse_node( element, writers, xml_files, sqlite_files ):
-    node_type = element.tag 
-    if node_type == "artist":
-        process_artist( element, writers )
-    elif node_type == "master":
-        process_master( element, writers, xml_files, sqlite_files )
-    elif node_type == "label":
-        process_label( element, writers, xml_files, sqlite_files )
+def format_eta( eta_seconds ):
+    if eta_seconds < 60:
+        return f"{eta_seconds:.0f}s"
+    if eta_seconds < 3600:
+        return f"{eta_seconds//60:.0f}m {eta_seconds%60:.0f}s"
+    return f"{eta_seconds//3600:.0f}h {(eta_seconds%3600)//60:.0f}m"
 
 
-def parse_xml( fn_xml, node_type, writers, xml_files, sqlite_files ):
-    context_size = os.path.getsize(fn_xml)
+def open_dump( fn ):
+    """
+    Open a Discogs dump for streaming, transparently handling gzip.
+
+    Returns (parse_fp, progress_fp, total_bytes). Progress is measured against
+    the *compressed* file: progress_fp is the raw handle, whose position
+    advances as the gzip layer consumes it, so percentages stay meaningful
+    without ever decompressing to disk.
+    """
+    raw = open( fn, "rb" )
+    if fn.endswith(".gz"):
+        return gzip.open( raw, "rb" ), raw, os.path.getsize(fn)
+    return raw, raw, os.path.getsize(fn)
+
+
+def stream_elements( fn_xml, tag, on_element ):
+    """
+    Stream <tag> elements from an XML dump, calling on_element(element) for each.
+
+    Only matching elements are reported (iterparse tag filter), and each is
+    pruned along with its already-processed previous siblings once handled, so
+    peak memory stays flat regardless of file size. Without that pruning the
+    cleared elements accumulate under the root as empty nodes, which costs over
+    a gigabyte across a full releases dump.
+    """
+    parse_fp, progress_fp, total_bytes = open_dump( fn_xml )
     start_time = time.time()
-    
-    with open(fn_xml, "rb") as fp_xml:
-        context = et.iterparse(
-            fp_xml,
-            events=["end"]
-        )
+    num_records = 0
+    num_errors = 0
 
-        num_records = 0
-        num_errors = 0
+    try:
+        context = et.iterparse( parse_fp, events=("end",), tag=tag )
 
         with alive_bar(dual_line=True, receipt_text=True) as bar:
             for event, element in context:
 
-                # wait for the end of the tag we're looking for, otherwise we end up trying to parse all its children
-                if element.tag == node_type:
-                    
-                    try:
-                        parse_node( element, writers, xml_files, sqlite_files )
-                    except AttributeError as e:
-                        print( et.tostring(element) )
-                        print(repr(e))
-                        num_errors += 1
-                        # raise
-                
-                    num_records += 1
-                    element.clear()
-                    
-                current_pos = fp_xml.tell()
-                pc = (current_pos / context_size) * 100
-                
-                # Calculate ETA
+                try:
+                    on_element( element )
+                except AttributeError as e:
+                    print( et.tostring(element) )
+                    print( repr(e) )
+                    num_errors += 1
+
+                num_records += 1
+
+                parent = element.getparent()
+                element.clear()
+                if parent is not None:
+                    while element.getprevious() is not None:
+                        del parent[0]
+
+                # Progress is updated per matched element rather than per XML
+                # event: on a releases dump the latter fires over a billion
+                # times and the bookkeeping alone costs hours.
+                current_pos = progress_fp.tell()
+                pc = (current_pos / total_bytes) * 100
                 elapsed_time = time.time() - start_time
                 if pc > 0 and elapsed_time > 0:
                     bytes_per_second = current_pos / elapsed_time
-                    remaining_bytes = context_size - current_pos
-                    eta_seconds = remaining_bytes / bytes_per_second
-                    
-                    # Format ETA
-                    if eta_seconds < 60:
-                        eta_str = f"{eta_seconds:.0f}s"
-                    elif eta_seconds < 3600:
-                        eta_str = f"{eta_seconds//60:.0f}m {eta_seconds%60:.0f}s"
-                    else:
-                        eta_str = f"{eta_seconds//3600:.0f}h {(eta_seconds%3600)//60:.0f}m"
-                    
-                    bar.text(f"{pc:.2f}% of file (ETA: {eta_str})")
+                    eta_seconds = (total_bytes - current_pos) / bytes_per_second
+                    bar.text(f"{pc:.2f}% of {os.path.basename(fn_xml)} (ETA: {format_eta(eta_seconds)})")
                 else:
-                    bar.text(f"{pc:.2f}% of file")
-                bar() 
-                
-        
-        print(f"Processed {num_records:,} {node_type} with {num_errors:,} errors "
-              f"({(num_errors/num_records) * 100}% error rate)")
+                    bar.text(f"{pc:.2f}% of {os.path.basename(fn_xml)}")
+                bar()
+    finally:
+        parse_fp.close()
+        if progress_fp is not parse_fp:
+            progress_fp.close()
+
+    error_rate = (num_errors / num_records * 100) if num_records else 0.0
+    print(f"Processed {num_records:,} {tag} with {num_errors:,} errors "
+          f"({error_rate:.4f}% error rate)")
+    return num_records
+
+
+def collect_main_release_ids( fn_master_xml ):
+    """
+    First pass of the prefilter: read the masters dump and collect the set of
+    main_release IDs.
+
+    Only these releases are ever imported -- roughly 3M of the ~18M in the
+    releases dump -- so knowing the set up front means the releases dump can be
+    streamed once, straight from its .gz, instead of being split, indexed into
+    SQLite and randomly accessed.
+    """
+    wanted = set()
+
+    def on_master( element ):
+        main_release = element.find("main_release")
+        if main_release is not None and main_release.text:
+            wanted.add( int(main_release.text) )
+
+    print(f"Collecting main_release IDs from {fn_master_xml}")
+    stream_elements( fn_master_xml, "master", on_master )
+    print(f"  {len(wanted):,} distinct main_release IDs")
+    return wanted
+
+
+def parse_releases_filtered( fn_release_xml, wanted_ids, writers, xml_files, sqlite_files ):
+    """
+    Second pass of the prefilter: stream the releases dump and write out only
+    the releases named by wanted_ids.
+    """
+    stats = { "matched": 0 }
+
+    def on_release( element ):
+        try:
+            release_id = int( element.attrib["id"] )
+        except (KeyError, ValueError):
+            return
+        if release_id in wanted_ids:
+            stats["matched"] += 1
+            process_release( element, writers, xml_files, sqlite_files )
+
+    print(f"Streaming {fn_release_xml}, keeping {len(wanted_ids):,} releases")
+    stream_elements( fn_release_xml, "release", on_release )
+    print(f"  wrote {stats['matched']:,} releases")
+
+    missing = len(wanted_ids) - stats["matched"]
+    if missing > 0:
+        print(f"  note: {missing:,} main_release IDs were not found in the releases dump")
 
 
 @click.command()
-@click.option('--artist-xml', type=click.Path(exists=True), help='Path to artist XML file')
-@click.option('--release-sqlite', type=click.Path(exists=True), help='Path to release SQLite index (built by releases_to_sqlite.py)')
-@click.option('--label-xml', type=click.Path(exists=True), help='Path to label XML file')
-@click.option('--label-sqlite', type=click.Path(), help='Path to label SQLite file (created if absent)')
-@click.option('--master-xml', type=click.Path(exists=True), help='Path to master XML file')
+@click.option('--artist-xml', type=click.Path(exists=True), help='Path to artist XML dump (.xml or .xml.gz)')
+@click.option('--master-xml', type=click.Path(exists=True), help='Path to master XML dump (.xml or .xml.gz)')
+@click.option('--label-xml', type=click.Path(exists=True), help='Path to label XML dump (.xml or .xml.gz)')
+@click.option('--release-xml', type=click.Path(exists=True), help='Path to release XML dump (.xml or .xml.gz). Streamed once, prefiltered to the main_release IDs named by --master-xml. Preferred.')
+@click.option('--release-sqlite', type=click.Path(exists=True), help='Path to a prebuilt release SQLite index (see releases_to_sqlite.py). Alternative to --release-xml.')
+@click.option('--label-sqlite', type=click.Path(), help='Path to label SQLite file (created if absent). Needed to dedupe labels.')
 @click.option('--output-folder', required=True, type=click.Path(), help='Output folder for CSV files (must be empty)')
-def main(artist_xml, release_sqlite, label_xml, label_sqlite, master_xml, output_folder):
+def main(artist_xml, master_xml, label_xml, release_xml, release_sqlite, label_sqlite, output_folder):
 
-    if master_xml is not None and release_sqlite is None:
-        print( "If a masters file is specified, --release-sqlite must also be specified." )
+    if release_xml and release_sqlite:
+        print( "Specify either --release-xml or --release-sqlite, not both." )
+        exit(1)
+
+    if master_xml is not None and (release_xml is None and release_sqlite is None):
+        print( "If a masters file is specified, --release-xml or --release-sqlite must also be specified." )
+        exit(1)
+
+    if release_xml is not None and master_xml is None:
+        print( "--release-xml needs --master-xml: the master dump names which releases to keep." )
         exit(1)
 
     os.makedirs(output_folder, exist_ok=True)
@@ -381,13 +454,33 @@ def main(artist_xml, release_sqlite, label_xml, label_sqlite, master_xml, output
 
     init_sqlite_files( sqlite_files )
 
-    write_releases = sqlite_files["release"] is not None
+    write_releases = (release_xml is not None) or (sqlite_files["release"] is not None)
     writers = init_csv_writers( output_folder, xml_files, write_releases )
 
-    for node_type, xml_file in xml_files.items():
-        if xml_file:
-            print(f"Processing {node_type} from {xml_file}")
-            parse_xml( xml_file, node_type, writers, xml_files, sqlite_files )
+    # Artists and labels are independent single passes. Labels go first so that
+    # the richer records from the labels dump land before the bare name-only
+    # references picked up from release listings.
+    if label_xml:
+        print(f"Processing label from {label_xml}")
+        stream_elements( label_xml, "label",
+            lambda e: process_label( e, writers, xml_files, sqlite_files ) )
+
+    if artist_xml:
+        print(f"Processing artist from {artist_xml}")
+        stream_elements( artist_xml, "artist",
+            lambda e: process_artist( e, writers ) )
+
+    if release_xml:
+        # Preferred path: two streaming passes, no index, reads .gz directly.
+        wanted_ids = collect_main_release_ids( master_xml )
+        parse_releases_filtered(
+            release_xml, wanted_ids, writers, xml_files, sqlite_files
+        )
+    elif master_xml:
+        # Index path: one pass over masters, random-access lookup per release.
+        print(f"Processing master from {master_xml}")
+        stream_elements( master_xml, "master",
+            lambda e: process_master( e, writers, xml_files, sqlite_files ) )
 
     for k in sqlite_files:
         v = sqlite_files[k]

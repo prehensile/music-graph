@@ -16,19 +16,35 @@ offset = 0
 
 tag_close = f"</{tag_name}>".encode()
 
+READ_CHUNK = 1 << 20  # 1 MiB
+
+
 def find_next_tag_end(fp, tag_close, start_pos):
-    """Find the next occurrence of tag_close starting from start_pos"""
+    """
+    Find the byte offset just past the next occurrence of tag_close at or after
+    start_pos, or None at EOF.
+
+    Reads in 1 MiB blocks rather than a byte at a time. The byte-at-a-time
+    version managed ~2.7 MiB/s, which on a ~110 GiB releases dump meant roughly
+    12 hours for this step alone; buffered, it runs at disk speed. Blocks
+    overlap by len(tag_close)-1 bytes so a match straddling a boundary is not
+    missed.
+    """
     fp.seek(start_pos)
-    buf = b""
     lc = len(tag_close)
-    
+    overlap = b""
+    base = start_pos
+
     while True:
-        byte = fp.read(1)
-        if not byte:  # EOF
+        block = fp.read(READ_CHUNK)
+        if not block:
             return None
-        buf += byte
-        if buf[-lc:] == tag_close:
-            return fp.tell()
+        buf = overlap + block
+        idx = buf.find(tag_close)
+        if idx != -1:
+            return base - len(overlap) + idx + lc
+        overlap = buf[-(lc - 1):] if lc > 1 else b""
+        base += len(block)
 
 offsets = [0]
 
@@ -58,9 +74,15 @@ with open(fn_xml, "rb") as fp_xml:
         offsets.append(next_split)
         current_pos = next_split
 
-print( offsets )
+# Guarantee the final chunk runs to EOF whichever branch above exited the loop.
+# The `tag_end is None` break used to leave offsets short of xml_size, which
+# dropped the trailing bytes -- including the root's closing tag. Because the
+# last chunk is also the one that gets no synthetic tail, it came out
+# unterminated and every record in it was silently lost at parse time.
+if offsets[-1] != xml_size:
+    offsets.append(xml_size)
 
-fp_xml.close()
+print( offsets )
 
 
 def extract_section( input_file, output_file, start, size, head=None, tail=None ):
