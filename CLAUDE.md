@@ -282,7 +282,8 @@ The arc: naive parse → generalise → ripgrep → binary search → SQLite ind
 - **`labels.csv` is written twice.** The transform creates a header-only placeholder whenever `--label-xml` is given; `sqlite_to_csv.py` overwrites it with the real export. Skipping that second step leaves an empty label set and dangling `RELEASED_ON` edges.
 - **Sublabels can dangle.** Sublabels go into `label_sublabel_links.csv` but not `labels.csv`, assuming every sublabel also appears as a top-level `<label>`. True for full dumps, not partial ones; add `--skip-bad-relationships=true` if the import aborts on these.
 - **The full-text index must exist** before search works. `provision_droplet.sh` creates it and waits via `db.awaitIndexes`; building it over ~15M nodes takes a while. Without it, `/api/search` returns a "query failed" error.
-- **Dump URL pattern is unverified** from the sandbox this was written in (egress policy blocked the bucket). `provision_droplet.sh` fails loudly with the index URL if a download 404s.
+- **Dumps download from `data.discogs.com`, not the S3 bucket directly.** Anonymous GETs against `discogs-data-dumps.s3.us-west-2.amazonaws.com` return 403, and since the bucket also denies anonymous listing, S3 answers 403 rather than 404 for a key that is simply absent — so a wrong path looks like a permissions problem. The front end takes the object key url-encoded in a query parameter: `https://data.discogs.com/?download=data%2F2026%2Fdiscogs_20260801_artists.xml.gz`. `DUMP_HOST` and `DUMP_PREFIX` override it if that ever changes.
+- **Preflight HEADs all four dump URLs** so a wrong date or path fails in seconds instead of several minutes in. It must be HEAD: a server that ignores `Range` answers a ranged GET with the whole body, which would mean pulling 10 GB during a two-second check.
 - **The viewer is plain HTTP.** Fine for a throwaway droplet; put it behind a TLS terminator before treating it as anything more.
 
 ### Fixed along the way

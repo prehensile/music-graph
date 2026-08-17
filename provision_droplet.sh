@@ -41,7 +41,24 @@ GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 # Community Edition serves exactly one user database, so import into the
 # default. Naming it anything else yields a database Neo4j will not start.
 DATABASE="${DATABASE:-neo4j}"
-BASE_URL="https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${DUMP_YEAR}"
+
+# The S3 bucket does not serve objects to anonymous callers -- a direct GET
+# returns 403, and because the bucket also denies anonymous listing, S3 answers
+# 403 rather than 404 for a key that is simply absent, which makes a wrong path
+# look like a permissions problem. Downloads go through the Discogs front end
+# instead, which takes the object key url-encoded in a query parameter:
+#
+#   https://data.discogs.com/?download=data%2F2026%2Fdiscogs_20260801_artists.xml.gz
+#
+DUMP_HOST="${DUMP_HOST:-https://data.discogs.com/}"
+DUMP_PREFIX="${DUMP_PREFIX:-data/${DUMP_YEAR}}"
+DUMP_INDEX_URL="https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html"
+
+# Build the download URL for one dump file, url-encoding the slashes in the key.
+dump_url() {
+    printf '%s?download=%s%%2F%s' \
+        "$DUMP_HOST" "${DUMP_PREFIX//\//%2F}" "$1"
+}
 
 LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
 STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
@@ -130,6 +147,8 @@ public_ip() {
 
 preflight() {
     mkdir -p "$DATA_DIR" "$CSV_DIR"
+
+    check_dump_urls
 
     local avail_gb
     avail_gb=$(df -BG --output=avail "$DATA_DIR" | tail -1 | tr -dc '0-9')
@@ -247,19 +266,48 @@ fetch_repo() {
 
 # ---------------------------------------------------------------- dumps
 
+check_dump_urls() {
+    # Run during preflight so a wrong date or path fails in seconds, rather
+    # than several minutes into an unattended provision.
+    if ! have curl; then
+        echo "  curl not present yet; skipping the URL check"
+        return 0
+    fi
+
+    # HEAD, not a ranged GET. A server that ignores Range answers a range
+    # request with the whole body, which here would mean downloading 10 GB
+    # during what is supposed to be a two-second check. HEAD carries no body.
+    local name url code bad=0
+    echo "  checking dump URLs under ${DUMP_HOST}?download=${DUMP_PREFIX}/"
+    for name in artists labels masters releases; do
+        url=$(dump_url "discogs_${DUMP_DATE}_${name}.xml.gz")
+        code=$(curl -sS --head -o /dev/null -w '%{http_code}' --max-time 30 "$url" 2>/dev/null || echo 000)
+        printf '    %-9s HTTP %s\n' "$name" "$code"
+        [[ "$code" == 200 ]] || bad=1
+    done
+
+    if (( bad )); then
+        echo "  Could not reach the dumps for ${DUMP_DATE}." >&2
+        echo "  Confirm that date exists at ${DUMP_INDEX_URL}" >&2
+        echo "  If the layout has changed, copy a dump's link from that page and" >&2
+        echo "  set DUMP_HOST / DUMP_PREFIX to match." >&2
+        return 1
+    fi
+}
+
 download_dumps() {
     local checksums="$DATA_DIR/discogs_${DUMP_DATE}_CHECKSUM.txt"
 
     if [[ ! -s "$checksums" ]]; then
         curl -fsSL --retry 5 --retry-delay 5 \
-            "$BASE_URL/discogs_${DUMP_DATE}_CHECKSUM.txt" -o "$checksums" \
+            "$(dump_url "discogs_${DUMP_DATE}_CHECKSUM.txt")" -o "$checksums" \
             || echo "  no CHECKSUM file retrieved; downloads will not be verified"
     fi
 
-    local kind f url
-    for kind in artists labels masters releases; do
-        f="$DATA_DIR/discogs_${DUMP_DATE}_${kind}.xml.gz"
-        url="$BASE_URL/discogs_${DUMP_DATE}_${kind}.xml.gz"
+    local name f url
+    for name in artists labels masters releases; do
+        f="$DATA_DIR/discogs_${DUMP_DATE}_${name}.xml.gz"
+        url=$(dump_url "discogs_${DUMP_DATE}_${name}.xml.gz")
 
         if [[ -s "$f" ]] && gzip -t "$f" 2>/dev/null; then
             echo "  have $(basename "$f") ($(du -h "$f" | cut -f1)), skipping"
@@ -267,13 +315,23 @@ download_dumps() {
         fi
 
         echo "  fetching $(basename "$f")"
+        # -C - resumes an interrupted download. Verified safe: against a
+        # server that ignores Range, curl exits 33 ("Cannot resume") and leaves
+        # the partial file alone rather than appending a second copy. The
+        # failure path below then deletes it so a re-run starts clean.
         curl -fL --retry 5 --retry-delay 10 -C - "$url" -o "$f" || {
             echo "  FAILED: $url" >&2
-            echo "  Check the date exists and the URL pattern still holds:" >&2
-            echo "    https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html" >&2
+            echo "  Confirm the date exists at ${DUMP_INDEX_URL}" >&2
+            rm -f "$f"
             exit 1
         }
-        gzip -t "$f" || { echo "  $(basename "$f") is not valid gzip" >&2; exit 1; }
+        # A truncated or HTML-error-page download fails this. Delete it so a
+        # re-run fetches cleanly instead of trying to resume rubbish.
+        gzip -t "$f" || {
+            echo "  $(basename "$f") is not valid gzip -- discarding it" >&2
+            rm -f "$f"
+            exit 1
+        }
     done
 
     verify_checksums "$checksums"
