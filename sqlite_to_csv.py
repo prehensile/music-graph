@@ -13,7 +13,7 @@ def main(output_folder, sqlite_path):
 
     fn_csv = f"{output_folder}/labels.csv"
     writer = csv.writer( open(fn_csv,"w"), quoting=csv.QUOTE_STRINGS )
-    writer.writerow( ["labelId:ID(Label)", "year", "title"] )
+    writer.writerow( ["labelId:ID(Label)", "name", "profile"] )
 
     conn = sqlite3.connect(sqlite_path)
     cursor = conn.cursor()
