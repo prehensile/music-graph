@@ -1,706 +1,365 @@
-class KnowledgeGraphViewer {
-    constructor() {
-        this.graph = new graphology.Graph();
-        this.sigma = null;
-        this.neo4jDriver = null;
-        this.ollamaUrl = (window.MUSIC_GRAPH_CONFIG || {}).ollamaUrl || 'http://localhost:11434';
-        this.physics = {
-            nodes: new Map(),
-            running: false,
-            damping: 0.85,
-            repulsion: 800,
-            attraction: 0.01,
-            centerForce: 0.001,
-            collisionEnabled: true,
-            restitution: 1.0
-        };
-        this.dragging = null;
-        this.wasDragging = false;
-        this.init();
+/*
+ * Music Graph viewer.
+ *
+ * Talks only to this server's own JSON API -- no database credentials reach the
+ * page and no Cypher is built here. Layout is Fruchterman-Reingold with a
+ * cooling schedule (see runLayout), so hub-heavy Discogs subgraphs settle
+ * instead of oscillating the way the original viewer's uncooled simulation did.
+ */
+'use strict';
+
+const COLOURS = {
+  Artist:  '#38bdf8',
+  Group:   '#a78bfa',
+  Release: '#fb7185',
+  Label:   '#34d399',
+  Unknown: '#94a3b8',
+};
+
+const REL_LABEL = {
+  MEMBER_OF:   'member of',
+  CREDITED:    'credited on',
+  RELEASED_ON: 'released on',
+  SUBLABEL:    'sublabel of',
+};
+
+const $ = (id) => document.getElementById(id);
+
+class Viewer {
+  constructor() {
+    this.graph = new graphology.Graph({ multi: false, type: 'undirected' });
+    this.renderer = null;
+    this.layout = null;
+    this.selected = null;
+    this.expanded = new Set();
+
+    this.initRenderer();
+    this.initLegend();
+    this.bindEvents();
+    this.loadStats();
+  }
+
+  // ---------------------------------------------------------------- setup
+
+  initRenderer() {
+    this.renderer = new Sigma(this.graph, $('graph'), {
+      renderEdgeLabels: false,
+      defaultNodeColor: COLOURS.Unknown,
+      defaultEdgeColor: 'rgba(148,163,184,0.35)',
+      labelColor: { color: '#e2e8f0' },
+      labelSize: 12,
+      labelWeight: '500',
+      labelDensity: 0.6,
+      labelGridCellSize: 70,
+      labelRenderedSizeThreshold: 9,
+      minCameraRatio: 0.05,
+      maxCameraRatio: 12,
+      allowInvalidContainer: true,
+      zIndex: true,
+    });
+
+    this.renderer.on('clickNode', ({ node }) => this.select(node));
+    this.renderer.on('doubleClickNode', ({ node, event }) => {
+      if (event && event.preventSigmaDefault) event.preventSigmaDefault();
+      this.expand(node);
+    });
+    this.renderer.on('enterNode', () => { document.body.style.cursor = 'pointer'; });
+    this.renderer.on('leaveNode', () => { document.body.style.cursor = 'default'; });
+    this.renderer.on('clickStage', () => this.select(null));
+  }
+
+  initLegend() {
+    $('legend').innerHTML = Object.keys(COLOURS)
+      .filter((k) => k !== 'Unknown')
+      .map((k) => `<li><i style="background:${COLOURS[k]}"></i>${k}</li>`)
+      .join('');
+  }
+
+  bindEvents() {
+    $('search-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const term = $('q').value.trim();
+      if (term) {
+        $('q').blur();           // dismisses the on-screen keyboard
+        this.search(term);
+      }
+    });
+    $('reset').addEventListener('click', () => this.clear());
+    $('panel-close').addEventListener('click', () => this.select(null));
+    $('panel-expand').addEventListener('click', () => {
+      if (this.selected) this.expand(this.selected);
+    });
+  }
+
+  // ------------------------------------------------------------- fetching
+
+  async api(path) {
+    const res = await fetch(path, { headers: { Accept: 'application/json' } });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.json()).error || detail; } catch (_) { /* keep */ }
+      throw new Error(detail);
     }
+    return res.json();
+  }
 
-    init() {
-        this.initSigma();
-        this.initNeo4j();
-        this.setupEventListeners();
-        this.loadDefaultData();
-        this.startPhysicsSimulation();
+  busy(on) {
+    $('spinner').hidden = !on;
+    $('go').disabled = on;
+  }
+
+  async loadStats() {
+    try {
+      const stats = await this.api('/api/stats');
+      const total = Object.values(stats).reduce((a, b) => a + b, 0);
+      $('counts').textContent = total
+        ? Object.entries(stats).map(([k, v]) => `${v.toLocaleString()} ${k}`).join(' · ')
+        : 'empty graph';
+    } catch (_) {
+      $('counts').textContent = '';
     }
+  }
 
-    initSigma() {
-        const container = document.getElementById('graph-container');
-        this.sigma = new Sigma(this.graph, container, {
-            renderEdgeLabels: false,
-            defaultNodeColor: '#ec4899',
-            defaultEdgeColor: '#64748b',
-            labelColor: { color: '#ffffff' },
-            labelSize: 14,
-            enableEdgeHoverEvents: true,
-            enableNodeHoverEvents: true,
-            allowInvalidContainer: true,
-            labelRenderer: (context, data, settings) => {
-                const size = settings.labelSize;
-                const font = settings.labelFont;
-                const weight = settings.labelWeight;
-                
-                context.fillStyle = '#ffffff';
-                context.font = `${weight} ${size}px ${font}`;
-                context.textAlign = 'center';
-                context.textBaseline = 'middle';
-                context.fillText(data.label, data.x, data.y);
-            },
-            hoverRenderer: (context, data, settings) => {
-                const size = settings.labelSize;
-                const font = settings.labelFont;
-                const weight = settings.labelWeight;
-                
-                context.textAlign = 'center';
-                context.textBaseline = 'middle';
-                const textWidth = context.measureText(data.label).width;
-                
-                // Background
-                context.fillStyle = 'rgba(0, 0, 0, 0.8)';
-                context.fillRect(data.x - textWidth/2 - 3, data.y - size/2 - 2, textWidth + 6, size + 4);
-                
-                // Text
-                context.fillStyle = '#ffffff';
-                context.font = `${weight} ${size}px ${font}`;
-                context.fillText(data.label, data.x, data.y);
-            },
-            nodeReducer: (node, data) => {
-                return {
-                    ...data,
-                    size: data.size || 10,
-                    color: data.color || '#ec4899'
-                };
-            },
-            edgeReducer: (edge, data) => ({
-                ...data,
-                color: data.color || '#64748b',
-                size: 1.5
-            })
-        });
-
-        this.setupMouseInteractions();
-        
-        window.addEventListener('resize', () => {
-            this.sigma.refresh();
-        });
+  async search(term) {
+    this.busy(true);
+    try {
+      const data = await this.api(`/api/search?q=${encodeURIComponent(term)}`);
+      this.graph.clear();
+      this.expanded.clear();
+      this.select(null);
+      const added = this.merge(data);
+      $('hint').hidden = added > 0;
+      if (!added) this.toast(`Nothing found for “${term}”`);
+      this.runLayout();
+    } catch (err) {
+      this.toast(err.message);
+    } finally {
+      this.busy(false);
     }
+  }
 
-    initNeo4j() {
-        const config = window.MUSIC_GRAPH_CONFIG || {};
-        const NEO4J_URI = config.neo4jUri || 'bolt://localhost:7687';
-        const NEO4J_USER = config.neo4jUser || 'neo4j';
-        const NEO4J_PASSWORD = config.neo4jPassword || '';
+  async expand(nodeId) {
+    if (this.expanded.has(nodeId)) return;
+    this.expanded.add(nodeId);
+    this.busy(true);
+    try {
+      const data = await this.api(`/api/expand?id=${encodeURIComponent(nodeId)}`);
+      // Seed new nodes near their parent so the layout has a sane starting point.
+      const origin = this.graph.hasNode(nodeId)
+        ? this.graph.getNodeAttributes(nodeId)
+        : { x: 0, y: 0 };
+      const added = this.merge(data, origin);
+      if (!added) this.toast('No further connections');
+      this.runLayout();
+    } catch (err) {
+      this.expanded.delete(nodeId);
+      this.toast(err.message);
+    } finally {
+      this.busy(false);
+    }
+  }
 
-        if (!NEO4J_PASSWORD) {
-            this.showError('No Neo4j password configured. Copy web/config.example.js to web/config.js and set your credentials.');
-            return;
+  // -------------------------------------------------------------- drawing
+
+  merge(data, origin) {
+    let added = 0;
+    const base = origin || { x: 0, y: 0 };
+
+    (data.nodes || []).forEach((n) => {
+      if (this.graph.hasNode(n.id)) {
+        // Keep the larger degree so a node does not shrink when re-seen in a
+        // smaller subgraph.
+        const prev = this.graph.getNodeAttribute(n.id, 'degree') || 0;
+        if (n.degree > prev) {
+          this.graph.setNodeAttribute(n.id, 'degree', n.degree);
+          this.graph.setNodeAttribute(n.id, 'size', this.sizeFor(n.degree));
         }
+        return;
+      }
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 8 + Math.random() * 40;
+      this.graph.addNode(n.id, {
+        ...n,
+        // Sigma renders `label`, so the node type is kept as `kind`. Without
+        // that split the panel shows the title where the type belongs.
+        kind: n.label,
+        label: n.title,
+        x: base.x + Math.cos(angle) * radius,
+        y: base.y + Math.sin(angle) * radius,
+        size: this.sizeFor(n.degree),
+        color: COLOURS[n.label] || COLOURS.Unknown,
+      });
+      added += 1;
+    });
 
-        try {
-            this.neo4jDriver = neo4j.driver(
-                NEO4J_URI,
-                neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
-            );
-        } catch (error) {
-            console.error('Failed to connect to Neo4j:', error);
-            this.showError('Failed to connect to Neo4j database. Please check your connection settings.');
-        }
-    }
+    (data.edges || []).forEach((e) => {
+      if (!this.graph.hasNode(e.source) || !this.graph.hasNode(e.target)) return;
+      if (e.source === e.target) return;
+      if (this.graph.hasEdge(e.source, e.target)) return;
+      this.graph.addEdge(e.source, e.target, { type_: e.type, size: 1 });
+    });
 
-    setupEventListeners() {
-        const queryInput = document.getElementById('query-input');
-        const queryButton = document.getElementById('query-button');
+    return added;
+  }
 
-        queryButton.addEventListener('click', () => this.executeQuery());
-        
-        queryInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                this.executeQuery();
-            }
-        });
-    }
+  sizeFor(degree) {
+    return Math.max(4, Math.min(26, 4 + Math.log2((degree || 0) + 1) * 3.2));
+  }
 
-    async executeQuery() {
-        const queryInput = document.getElementById('query-input');
-        const queryButton = document.getElementById('query-button');
-        const naturalLanguageQuery = queryInput.value.trim();
+  /*
+   * Fruchterman-Reingold with a cooling schedule, run in animation-frame
+   * batches so the graph is seen to settle and the UI stays responsive.
+   *
+   * The view is capped at a few hundred nodes, so O(n^2) repulsion costs
+   * nothing and Barnes-Hut is not worth a dependency. Cooling is the part the
+   * original viewer lacked: it ran a constant-energy simulation forever, with
+   * elastic collision impulses fighting the springs, so hub-heavy subgraphs
+   * jittered indefinitely instead of coming to rest.
+   */
+  runLayout() {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    const nodes = this.graph.nodes();
+    if (!nodes.length) return;
 
-        if (!naturalLanguageQuery) {
-            this.showError('Please enter a query');
-            return;
-        }
+    const k = Math.sqrt((820 * 820) / nodes.length); // ideal separation
+    const MAX_ITER = 240;
+    let temp = k * 0.85;
+    let iter = 0;
 
-        queryButton.disabled = true;
-        queryButton.textContent = 'Loading...';
-        queryInput.disabled = true;
-
-        try {
-            const cypherQuery = await this.convertNaturalLanguageToCypher(naturalLanguageQuery);
-            const result = await this.runNeo4jQuery(cypherQuery);
-            this.renderGraphData(result);
-        } catch (error) {
-            console.error('Query execution failed:', error);
-            this.showError('Query failed: ' + error.message);
-        } finally {
-            queryButton.disabled = false;
-            queryButton.textContent = 'Go';
-            queryInput.disabled = false;
-        }
-    }
-
-    async convertNaturalLanguageToCypher(naturalQuery) {
-        const trimmedQuery = naturalQuery.trim();
-        const isSimpleName = /^[a-zA-Z0-9\s'&.-]+$/.test(trimmedQuery) && !trimmedQuery.includes('show') && !trimmedQuery.includes('find') && !trimmedQuery.includes('get') && !trimmedQuery.includes('all');
-        
-        if (isSimpleName) {
-            return `MATCH (n)-[r]-(m) WHERE toLower(n.name) CONTAINS toLower('${trimmedQuery}') OR toLower(n.title) CONTAINS toLower('${trimmedQuery}') RETURN n, r, m LIMIT 50`;
-        }
-
-        const prompt = `You are a Neo4j Cypher query expert. Convert the following natural language query into a valid Cypher query.
-
-Context: You are working with a knowledge graph that contains Artist and Master nodes from Discogs data. Nodes have properties like 'name' and 'title'.
-
-Rules:
-- ALWAYS return both the main nodes AND their neighbors with full properties
-- Use this pattern: MATCH (n)-[r]-(m) RETURN n, r, m (not OPTIONAL MATCH)
-- Use CONTAINS for partial string matching with toLower() for case-insensitive search
-- Limit results to 50 or fewer
-- For artist queries, use the Artist label specifically
-- For master/release queries, use the Master label
-
-Examples:
-- "Goldie" → MATCH (n)-[r]-(m) WHERE toLower(n.name) CONTAINS toLower('goldie') OR toLower(n.title) CONTAINS toLower('goldie') RETURN n, r, m LIMIT 50
-- "show me drum and bass artists" → MATCH (a:Artist)-[r]-(m) WHERE toLower(a.name) CONTAINS toLower('drum') OR toLower(a.name) CONTAINS toLower('bass') RETURN a, r, m LIMIT 50
-
-Natural language query: "${naturalQuery}"
-
-Respond with ONLY the Cypher query, no explanation:`;
-
-        try {
-            const response = await fetch(`${this.ollamaUrl}/api/generate`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    model: 'llama3.2',
-                    prompt: prompt,
-                    stream: false
-                })
-            });
-
-            if (!response.ok) {
-                throw new Error(`Ollama request failed: ${response.status}`);
-            }
-
-            const data = await response.json();
-            const cypherQuery = data.response.trim();
-            
-            console.log('Generated Cypher:', cypherQuery);
-            return cypherQuery;
-        } catch (error) {
-            console.error('Failed to convert query with Ollama:', error);
-            return `MATCH (n) WHERE toLower(n.name) CONTAINS toLower('${naturalQuery}') OR toLower(n.title) CONTAINS toLower('${naturalQuery}') OPTIONAL MATCH (n)-[r]-(m) RETURN n, r, m LIMIT 50`;
-        }
-    }
-
-    async runNeo4jQuery(cypherQuery) {
-        if (!this.neo4jDriver) {
-            throw new Error('Neo4j connection not available');
-        }
-
-        const session = this.neo4jDriver.session();
-        try {
-            const result = await session.run(cypherQuery);
-            return result.records;
-        } finally {
-            await session.close();
-        }
-    }
-
-    processNodeFromRecord(value, nodes, parentNodeId = null) {
-        if (!value || !value.labels) return;
-        
-        const nodeId = value.identity.toString();
-        if (nodes.has(nodeId) || this.graph.hasNode(nodeId)) return;
-        
-        const nodeType = value.labels[0];
-        const labelProps = ['name', 'title'];
-        let label = `Node ${nodeId}`;
-        
-        for (const prop of labelProps) {
-            if (value.properties && value.properties[prop]) {
-                label = value.properties[prop];
-                break;
-            }
-        }
-        
-        // For additive rendering, spawn near the parent node being expanded
-        let x = Math.random() * 1000;
-        let y = Math.random() * 1000;
-        let parentNode = null;
-        
-        // If we have a specific parent node ID, spawn near that node
-        if (parentNodeId && this.graph.hasNode(parentNodeId)) {
-            parentNode = parentNodeId;
-            const parentAttrs = this.graph.getNodeAttributes(parentNodeId);
-            
-            // Calculate minimum spawn distance: parent radius + safety margin
-            const parentRadius = parentAttrs.size / 2;
-            const safetyMargin = 10;
-            const minDistance = parentRadius + safetyMargin;
-            const maxDistance = minDistance + 20; // Add some randomness
-            
-            // Generate random angle and distance
-            const angle = Math.random() * 2 * Math.PI;
-            const distance = minDistance + Math.random() * (maxDistance - minDistance);
-            
-            x = parentAttrs.x + Math.cos(angle) * distance;
-            y = parentAttrs.y + Math.sin(angle) * distance;
-        } else if (this.graph.order > 0) {
-            // Fallback: spawn near a random existing node
-            const existingNodes = this.graph.nodes();
-            const randomExisting = existingNodes[Math.floor(Math.random() * existingNodes.length)];
-            parentNode = randomExisting;
-            const parentAttrs = this.graph.getNodeAttributes(randomExisting);
-            
-            // Same logic for fallback spawning
-            const parentRadius = parentAttrs.size / 2;
-            const safetyMargin = 10;
-            const minDistance = parentRadius + safetyMargin;
-            const maxDistance = minDistance + 20;
-            
-            const angle = Math.random() * 2 * Math.PI;
-            const distance = minDistance + Math.random() * (maxDistance - minDistance);
-            
-            x = parentAttrs.x + Math.cos(angle) * distance;
-            y = parentAttrs.y + Math.sin(angle) * distance;
-        }
-        
-        nodes.set(nodeId, {
-            id: nodeId,
-            label: label,
-            nodeType: nodeType,
-            x: x,
-            y: y,
-            color: this.getNodeColor(nodeType),
-            parentNode: parentNode
-        });
-    }
-
-
-
-
-    renderGraphData(records, additive = false, parentNodeId = null) {
-        if (!additive) {
-            this.graph.clear();
-        }
-        
-        const nodes = new Map();
-        const relationships = [];
-
-        records.forEach(record => {
-            record.keys.forEach(key => {
-                const value = record.get(key);
-                
-                if (value && typeof value === 'object') {
-                    if (value.labels) {
-                        this.processNodeFromRecord(value, nodes, parentNodeId);
-                    } else if (value.type && value.start && value.end) {
-                        relationships.push({
-                            sourceId: value.start.toString(),
-                            targetId: value.end.toString(),
-                            type: value.type
-                        });
-                    }
-                }
-            });
-        });
-
-        nodes.forEach(node => {
-            this.graph.addNode(node.id, {
-                ...node,
-                size: 15, // Will be updated with correct degree-based size below
-                degree: 1,
-                mass: 1
-            });
-        });
-
-        relationships.forEach(rel => {
-            if (this.graph.hasNode(rel.sourceId) && this.graph.hasNode(rel.targetId)) {
-                if (!this.graph.hasEdge(rel.sourceId, rel.targetId)) {
-                    this.graph.addEdge(rel.sourceId, rel.targetId, {
-                        label: rel.type,
-                        color: '#64748b',
-                        size: 2
-                    });
-                }
-            }
-        });
-
-        // Extract degree counts from Neo4j records
-        const nodeDegrees = new Map();
-        records.forEach(record => {
-            record.keys.forEach(key => {
-                if (key.endsWith('_degree')) {
-                    const degreeValue = record.get(key);
-                    const nodeKey = key.replace('_degree', '');
-                    const nodeValue = record.get(nodeKey);
-                    if (nodeValue && nodeValue.identity) {
-                        const nodeId = nodeValue.identity.toString();
-                        nodeDegrees.set(nodeId, degreeValue.toNumber ? degreeValue.toNumber() : degreeValue);
-                    }
-                }
-            });
-        });
-
-        // Update labels, size, and mass with degree from Neo4j data
-        nodes.forEach(node => {
-            const degree = nodeDegrees.get(node.id) || 1;
-            const size = this.calculateNodeSize(degree);
-            const mass = this.calculateNodeMass(degree);
-            
-            this.graph.setNodeAttribute(node.id, 'label', node.label);
-            this.graph.setNodeAttribute(node.id, 'size', size);
-            this.graph.setNodeAttribute(node.id, 'degree', degree);
-            this.graph.setNodeAttribute(node.id, 'mass', mass);
-        });
-
-        this.initPhysicsNodes();
-        this.sigma.refresh();
-        
-        if (nodes.size === 0 && !additive) {
-            this.showError('No data found for your query');
-        }
-    }
-
-    async loadDefaultData() {
-        try {
-            const defaultQuery = `
-                MATCH (a:Artist)-[r]-(m) 
-                WHERE toLower(a.name) CONTAINS 'goldie'
-                WITH a, r, m
-                OPTIONAL MATCH (a)-[ra]-()
-                OPTIONAL MATCH (m)-[rm]-()
-                RETURN a, r, m, count(DISTINCT ra) as a_degree, count(DISTINCT rm) as m_degree
-                LIMIT 50
-            `;
-            const result = await this.runNeo4jQuery(defaultQuery);
-            this.renderGraphData(result);
-        } catch (error) {
-            console.error('Failed to load default data:', error);
-        }
-    }
-
-    setupMouseInteractions() {
-        // Disable panning
-        this.sigma.setSetting('enableEdgePanning', false);
-        this.sigma.setSetting('enableNodePanning', false);
-        
-        this.sigma.on('downNode', (e) => {
-            this.dragging = {
-                node: e.node,
-                startX: e.event.x,
-                startY: e.event.y,
-                nodeX: this.graph.getNodeAttribute(e.node, 'x'),
-                nodeY: this.graph.getNodeAttribute(e.node, 'y')
-            };
-            
-            const physicsNode = this.physics.nodes.get(e.node);
-            if (physicsNode) {
-                physicsNode.pinned = true;
-                physicsNode.vx = 0;
-                physicsNode.vy = 0;
-            }
-        });
-
-        this.sigma.on('clickNode', (e) => {
-            if (!this.wasDragging) {
-                this.expandNode(e.node);
-               // this.animateToNode(e.node);
-            }
-            this.wasDragging = false;
-        });
-
-        this.sigma.on('enterNode', () => {
-            document.body.style.cursor = 'pointer';
-        });
-
-        this.sigma.on('leaveNode', () => {
-            document.body.style.cursor = 'default';
-        });
-
-        this.sigma.getMouseCaptor().on('mousemove', (e) => {
-            if (this.dragging) {
-                this.wasDragging = true;
-                
-                const pos = this.sigma.viewportToGraph(e);
-                this.graph.setNodeAttribute(this.dragging.node, 'x', pos.x);
-                this.graph.setNodeAttribute(this.dragging.node, 'y', pos.y);
-                
-                const physicsNode = this.physics.nodes.get(this.dragging.node);
-                if (physicsNode) {
-                    physicsNode.x = pos.x;
-                    physicsNode.y = pos.y;
-                }
-                
-                this.sigma.refresh();
-            }
-        });
-
-        this.sigma.getMouseCaptor().on('mouseup', () => {
-            if (this.dragging) {
-                const physicsNode = this.physics.nodes.get(this.dragging.node);
-                if (physicsNode) {
-                    physicsNode.pinned = false;
-                }
-                this.dragging = null;
-                
-                setTimeout(() => {
-                    this.wasDragging = false;
-                }, 50);
-            }
-        });
-    }
-
-    getNodeColor(label) {
-        const colors = {
-            'Artist': '#3b82f6',
-            'Master': '#ec4899',
-            'Person': '#ef4444',
-            'Organization': '#6366f1',
-            'Location': '#10b981',
-            'Event': '#f59e0b',
-            'Concept': '#8b5cf6',
-            'Document': '#64748b',
-            'default': '#6b7280'
-        };
-        return colors[label] || colors['default'];
-    }
-
-    calculateNodeSize(degree) {
-        // Logarithmic scaling: log(degree + 1) to handle degree 0
-        const logScale = Math.log(degree + 1) * 8;
-        return Math.max(6, Math.min(50, logScale + 8));
-    }
-
-    calculateNodeMass(degree) {
-        return Math.max(0.5, degree * 0.3);
-    }
-
-    initPhysicsNodes() {
-        this.graph.forEachNode((nodeId, attributes) => {
-            if (!this.physics.nodes.has(nodeId)) {
-                const mass = attributes.mass || this.calculateNodeMass(attributes.degree || 1);
-                
-                this.physics.nodes.set(nodeId, {
-                    x: attributes.x,
-                    y: attributes.y,
-                    vx: 0,
-                    vy: 0,
-                    mass: mass,
-                    pinned: false
-                });
-            }
-        });
-    }
-
-    startPhysicsSimulation() {
-        if (this.physics.running) return;
-        this.physics.running = true;
-        
-        const animate = () => {
-            if (!this.physics.running) return;
-            
-            this.updatePhysics();
-            this.sigma.refresh();
-            requestAnimationFrame(animate);
-        };
-        
-        requestAnimationFrame(animate);
-    }
-
-    updatePhysics() {
-        const centerX = 0;
-        const centerY = 0;
-        
-        this.physics.nodes.forEach((physicsNode, nodeId) => {
-            if (physicsNode.pinned) return;
-            
-            let fx = 0, fy = 0;
-            
-            this.physics.nodes.forEach((otherNode, otherNodeId) => {
-                if (nodeId === otherNodeId) return;
-                
-                const dx = physicsNode.x - otherNode.x;
-                const dy = physicsNode.y - otherNode.y;
-                const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-                
-                let repulsion = this.physics.repulsion / (distance * distance);
-                
-                // Scale repulsion by masses - higher mass nodes repel more strongly
-                const nodeMass = physicsNode.mass;
-                const otherMass = this.physics.nodes.get(otherNodeId).mass;
-                const massEffect = Math.sqrt(nodeMass * otherMass) * 2;
-                repulsion *= massEffect;
-                
-                fx += (dx / distance) * repulsion / physicsNode.mass;
-                fy += (dy / distance) * repulsion / physicsNode.mass;
-            });
-            
-            this.graph.neighbors(nodeId).forEach(neighborId => {
-                const neighborNode = this.physics.nodes.get(neighborId);
-                if (!neighborNode) return;
-                
-                const dx = neighborNode.x - physicsNode.x;
-                const dy = neighborNode.y - physicsNode.y;
-                const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-                const idealDistance = 100;
-                const spring = (distance - idealDistance) * this.physics.attraction;
-                
-                fx += (dx / distance) * spring;
-                fy += (dy / distance) * spring;
-            });
-            
-            const centerDx = centerX - physicsNode.x;
-            const centerDy = centerY - physicsNode.y;
-            fx += centerDx * this.physics.centerForce;
-            fy += centerDy * this.physics.centerForce;
-            
-            physicsNode.vx = (physicsNode.vx + fx) * this.physics.damping;
-            physicsNode.vy = (physicsNode.vy + fy) * this.physics.damping;
-            
-            physicsNode.x += physicsNode.vx;
-            physicsNode.y += physicsNode.vy;
-            
-            this.graph.setNodeAttribute(nodeId, 'x', physicsNode.x);
-            this.graph.setNodeAttribute(nodeId, 'y', physicsNode.y);
-        });
-        
-        // Handle collisions
-        if (this.physics.collisionEnabled) {
-            this.handleCollisions();
-        }
-    }
-
-    handleCollisions() {
-        const nodeIds = Array.from(this.physics.nodes.keys());
-        
-        for (let i = 0; i < nodeIds.length; i++) {
-            for (let j = i + 1; j < nodeIds.length; j++) {
-                const nodeId1 = nodeIds[i];
-                const nodeId2 = nodeIds[j];
-                
-                const node1 = this.physics.nodes.get(nodeId1);
-                const node2 = this.physics.nodes.get(nodeId2);
-                
-                if (node1.pinned && node2.pinned) continue;
-                
-                const attrs1 = this.graph.getNodeAttributes(nodeId1);
-                const attrs2 = this.graph.getNodeAttributes(nodeId2);
-                
-                const dx = node2.x - node1.x;
-                const dy = node2.y - node1.y;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-                
-                const minDistance = (attrs1.size + attrs2.size) / 2 + 2; // Add small buffer
-                
-                if (distance < minDistance && distance > 0) {
-                    // Collision detected
-                    const overlap = minDistance - distance;
-                    const separationX = (dx / distance) * overlap * 0.5;
-                    const separationY = (dy / distance) * overlap * 0.5;
-                    
-                    // Separate the nodes
-                    if (!node1.pinned) {
-                        node1.x -= separationX;
-                        node1.y -= separationY;
-                        this.graph.setNodeAttribute(nodeId1, 'x', node1.x);
-                        this.graph.setNodeAttribute(nodeId1, 'y', node1.y);
-                    }
-                    
-                    if (!node2.pinned) {
-                        node2.x += separationX;
-                        node2.y += separationY;
-                        this.graph.setNodeAttribute(nodeId2, 'x', node2.x);
-                        this.graph.setNodeAttribute(nodeId2, 'y', node2.y);
-                    }
-                    
-                    // Calculate collision response (rebound)
-                    const relativeVx = node2.vx - node1.vx;
-                    const relativeVy = node2.vy - node1.vy;
-                    
-                    const normalX = dx / distance;
-                    const normalY = dy / distance;
-                    
-                    const relativeVelocityInNormal = relativeVx * normalX + relativeVy * normalY;
-                    
-                    // Don't resolve if velocities are separating
-                    // if (relativeVelocityInNormal > 0) continue;
-                    
-                    const restitution = this.physics.restitution;
-                    const impulse = -(1 + restitution) * relativeVelocityInNormal;
-                    const totalMass = node1.mass + node2.mass;
-                    
-                    const impulseX = impulse * normalX;
-                    const impulseY = impulse * normalY;
-                    
-                    if (!node1.pinned) {
-                        node1.vx -= impulseX * (node2.mass / totalMass);
-                        node1.vy -= impulseY * (node2.mass / totalMass);
-                    }
-                    
-                    if (!node2.pinned) {
-                        node2.vx += impulseX * (node1.mass / totalMass);
-                        node2.vy += impulseY * (node1.mass / totalMass);
-                    }
-                }
-            }
-        }
-    }
-
-    async expandNode(nodeId) {
-        try {
-            const query = `
-                MATCH (center)-[r1]-(neighbor)
-                WHERE id(center) = ${nodeId}
-                WITH center, r1, neighbor
-                OPTIONAL MATCH (center)-[rc]-()
-                OPTIONAL MATCH (neighbor)-[rn]-()
-                RETURN center, r1, neighbor, count(DISTINCT rc) as center_degree, count(DISTINCT rn) as neighbor_degree
-                LIMIT 50
-            `;
-            const result = await this.runNeo4jQuery(query);
-            this.renderGraphData(result, true, nodeId);
-        } catch (error) {
-            console.error('Failed to expand node:', error);
-            this.showError('Failed to expand node: ' + error.message);
-        }
-    }
-
-    animateToNode(nodeId) {
-        const nodeAttributes = this.graph.getNodeAttributes(nodeId);
-        const camera = this.sigma.getCamera();
-        
-        const targetX = nodeAttributes.x;
-        const targetY = nodeAttributes.y;
-        const targetRatio = 0.8; // Zoom level
-        
-        camera.animate(
-            { x: targetX, y: targetY, ratio: targetRatio },
-            { duration: 800, easing: 'quadInOut' }
+    const step = () => {
+      for (let pass = 0; pass < 4 && iter < MAX_ITER; pass += 1, iter += 1) {
+        this.layoutTick(nodes, k, temp);
+        temp *= 0.955;
+      }
+      this.renderer.refresh();
+      if (iter < MAX_ITER) {
+        this.raf = requestAnimationFrame(step);
+      } else {
+        this.raf = null;
+        // Pull back slightly once settled: sigma fits node centres, which
+        // leaves labels on the outermost nodes clipped at the viewport edge.
+        this.renderer.getCamera().animate(
+          { x: 0.5, y: 0.5, ratio: 1.2 }, { duration: 320 },
         );
+      }
+    };
+    this.raf = requestAnimationFrame(step);
+  }
+
+  layoutTick(nodes, k, temp) {
+    const g = this.graph;
+    const dx = new Float64Array(nodes.length);
+    const dy = new Float64Array(nodes.length);
+    const index = new Map(nodes.map((n, i) => [n, i]));
+    const pos = nodes.map((n) => g.getNodeAttributes(n));
+
+    for (let i = 0; i < nodes.length; i += 1) {
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        let ax = pos[i].x - pos[j].x;
+        let ay = pos[i].y - pos[j].y;
+        let d2 = ax * ax + ay * ay;
+        if (d2 < 0.01) {           // coincident nodes need a nudge to separate
+          ax = Math.random() - 0.5;
+          ay = Math.random() - 0.5;
+          d2 = ax * ax + ay * ay || 0.01;
+        }
+        const d = Math.sqrt(d2);
+        const f = (k * k) / d / d * k * 0.25;
+        dx[i] += (ax / d) * f; dy[i] += (ay / d) * f;
+        dx[j] -= (ax / d) * f; dy[j] -= (ay / d) * f;
+      }
     }
 
-    showError(message) {
-        console.error(message);
-        alert(message);
+    g.forEachEdge((_e, _a, source, target) => {
+      const i = index.get(source);
+      const j = index.get(target);
+      if (i === undefined || j === undefined) return;
+      const ax = pos[i].x - pos[j].x;
+      const ay = pos[i].y - pos[j].y;
+      const d = Math.hypot(ax, ay) || 0.01;
+      const f = (d * d) / k;
+      dx[i] -= (ax / d) * f; dy[i] -= (ay / d) * f;
+      dx[j] += (ax / d) * f; dy[j] += (ay / d) * f;
+    });
+
+    for (let i = 0; i < nodes.length; i += 1) {
+      const len = Math.hypot(dx[i], dy[i]) || 1;
+      const capped = Math.min(len, temp);
+      let x = pos[i].x + (dx[i] / len) * capped;
+      let y = pos[i].y + (dy[i] / len) * capped;
+      x -= x * 0.012;            // weak gravity keeps components in frame
+      y -= y * 0.012;
+      g.setNodeAttribute(nodes[i], 'x', x);
+      g.setNodeAttribute(nodes[i], 'y', y);
     }
+  }
+
+  // ------------------------------------------------------------ selection
+
+  select(nodeId) {
+    this.selected = nodeId;
+    const panel = $('panel');
+
+    if (!nodeId || !this.graph.hasNode(nodeId)) {
+      panel.hidden = true;
+      this.graph.forEachNode((n) => this.graph.removeNodeAttribute(n, 'highlighted'));
+      this.renderer.refresh();
+      return;
+    }
+
+    const a = this.graph.getNodeAttributes(nodeId);
+    $('panel-kind').textContent = a.kind;
+    $('panel-kind').style.background = COLOURS[a.kind] || COLOURS.Unknown;
+    $('panel-title').textContent = a.title;
+
+    const neighbours = this.graph.neighbors(nodeId).length;
+    const rows = [];
+    if (a.realname) rows.push(['Real name', a.realname]);
+    if (a.year) rows.push(['Year', a.year]);
+    rows.push(['Shown connections', String(neighbours)]);
+
+    const byType = {};
+    this.graph.forEachEdge(nodeId, (_e, attrs) => {
+      byType[attrs.type_] = (byType[attrs.type_] || 0) + 1;
+    });
+    Object.entries(byType).forEach(([t, c]) => {
+      rows.push([REL_LABEL[t] || t.toLowerCase().replace(/_/g, ' '), String(c)]);
+    });
+
+    $('panel-meta').innerHTML = rows
+      .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+    $('panel-profile').textContent = a.profile || '';
+    $('panel-expand').hidden = this.expanded.has(nodeId);
+    panel.hidden = false;
+
+    this.graph.forEachNode((n) => this.graph.setNodeAttribute(n, 'highlighted', n === nodeId));
+    this.renderer.refresh();
+  }
+
+  clear() {
+    this.graph.clear();
+    this.expanded.clear();
+    this.select(null);
+    $('q').value = '';
+    $('hint').hidden = false;
+    this.renderer.refresh();
+  }
+
+  toast(message) {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = message;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 3200);
+  }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-    new KnowledgeGraphViewer();
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  window.viewer = new Viewer();
 });

@@ -1,25 +1,54 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Knowledge Graph Viewer</title>
-    <script src="https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js"></script>
-    <script src="https://unpkg.com/sigma@2.4.0/build/sigma.min.js"></script>
-    <script src="https://unpkg.com/neo4j-driver@5.12.0/lib/browser/neo4j-web.min.js"></script>
-    <link rel="stylesheet" href="styles.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>Music Graph</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%F0%9F%8E%B5</text></svg>">
+<!-- Vendored locally by fetch_vendor.sh rather than loaded from a CDN, so the
+     page works on flaky mobile data and does not depend on unpkg being up. -->
+<script src="vendor/graphology.umd.min.js"></script>
+<script src="vendor/sigma.min.js"></script>
 </head>
 <body>
-    <div id="graph-container"></div>
-    
-    <div class="query-panel">
-        <div class="query-input-container">
-            <input type="text" id="query-input" placeholder="Enter your natural language query..." />
-            <button id="query-button">Go</button>
-        </div>
-    </div>
 
-    <script src="config.js"></script>
-    <script src="app.js"></script>
+<header>
+  <h1>Music&nbsp;Graph</h1>
+  <form id="search-form" autocomplete="off">
+    <input type="search" id="q" placeholder="Search artists, releases, labels…"
+           aria-label="Search" enterkeyhint="search">
+    <button type="submit" id="go">Search</button>
+  </form>
+</header>
+
+<main>
+  <div id="graph" role="application" aria-label="Graph view"></div>
+
+  <div id="hint" class="overlay">
+    <p>Search for an artist, release or label to begin.</p>
+    <p class="muted">Tap a node to pull in its neighbours.</p>
+  </div>
+
+  <div id="spinner" class="overlay" hidden><div class="dot"></div>Loading…</div>
+
+  <aside id="panel" hidden>
+    <button id="panel-close" aria-label="Close">&times;</button>
+    <span class="pill" id="panel-kind"></span>
+    <h2 id="panel-title"></h2>
+    <dl id="panel-meta"></dl>
+    <p id="panel-profile"></p>
+    <button id="panel-expand">Expand neighbours</button>
+  </aside>
+</main>
+
+<footer>
+  <ul id="legend"></ul>
+  <span id="counts" class="muted"></span>
+  <button id="reset" class="linkish">Clear</button>
+</footer>
+
+<script src="app.js"></script>
 </body>
 </html>

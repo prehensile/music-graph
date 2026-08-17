@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Provision a fresh Ubuntu 24.04 droplet and run a full Discogs -> Neo4j import,
-# unattended, using the prefilter path (no release index, no block storage).
+# Provision a fresh Ubuntu 24.04 droplet: build the graph from the Discogs
+# dumps, import it into Neo4j, and serve the viewer over HTTP.
 #
 #   Recommended droplet: s-4vcpu-8gb (8 GB / 4 vCPU / 160 GB SSD)
 #   Expected peak disk:   ~35 GB     Expected runtime: ~4-6 hours
@@ -10,30 +10,25 @@
 #
 #   export DUMP_DATE=20250801
 #   export NEO4J_PASSWORD='choose-something'
-#   ./provision_droplet.sh 2>&1 | tee -a /var/log/music-graph.log
+#   export APP_PASSWORD='choose-something-else'
+#   ./provision_droplet.sh
 #
-# Long enough to outlive an SSH session, so run it under screen/tmux, or:
-#   nohup ./provision_droplet.sh > /var/log/music-graph.log 2>&1 &
-#
-# Every step is idempotent: completed work is detected and skipped, so it is
-# safe to re-run after a failure or disconnect.
+# Progress goes to /var/log/music-graph.log, with the current stage on one line
+# in /var/log/music-graph.status and any failure recorded in both. Every step is
+# idempotent, so it is safe to re-run after a failure or disconnect.
 #
 set -euo pipefail
 
 DUMP_DATE="${DUMP_DATE:?set DUMP_DATE, e.g. 20250801 (see https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html)}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:?set NEO4J_PASSWORD}"
 
-# Optional, both aimed at running this without a terminal to watch:
-#   NTFY_TOPIC        push a notification at each stage to https://ntfy.sh/<topic>
-#                     Pick something unguessable -- ntfy topics are public to
-#                     anyone who knows the name.
-#   TAILSCALE_AUTHKEY join a tailnet so Neo4j Browser is reachable privately,
-#                     with no ports open to the internet.
-NTFY_TOPIC="${NTFY_TOPIC:-}"
-TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
-
-LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
-STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
+# Guards the viewer with HTTP basic auth. It defaults to the database password
+# only so a run is not blocked on setting it; prefer a separate throwaway,
+# because the app is served over plain HTTP and the credential crosses the wire
+# in the clear.
+APP_PASSWORD="${APP_PASSWORD:-$NEO4J_PASSWORD}"
+APP_USER="${APP_USER:-music}"
+APP_PORT="${APP_PORT:-80}"
 
 DUMP_YEAR="${DUMP_DATE:0:4}"
 DATA_DIR="${DATA_DIR:-/var/lib/music-graph/data}"
@@ -46,49 +41,43 @@ REPO_BRANCH="${REPO_BRANCH:-main}"
 DATABASE="${DATABASE:-neo4j}"
 BASE_URL="https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${DUMP_YEAR}"
 
+LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
+STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
+ENV_FILE=/etc/music-graph.env
+UNIT_FILE=/etc/systemd/system/music-graph.service
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Checked before anything opens a file in /var/log, so a non-root run says why
 # rather than dying on a permission error.
 [[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 
-# Mirror all output to LOG_FILE so a cloud-init run (where nothing is watching
-# stdout) is still debuggable, and so the failure notification can quote a tail.
-# Interactively, tee so it is visible live. Unattended, redirect straight to the
-# file: process substitution can lose buffered output when the shell exits,
-# which would truncate exactly the failure trace worth having.
+# Interactively, tee so progress is visible live. Unattended, redirect straight
+# to the file: process substitution can lose buffered output when the shell
+# exits, truncating exactly the failure trace worth having.
 if [[ -t 1 ]]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 else
     exec >> "$LOG_FILE" 2>&1
 fi
 
-notify() {
-    [[ -n "$NTFY_TOPIC" ]] || return 0
-    curl -fsS --max-time 15 \
-        -H "Title: music-graph" \
-        -H "Priority: ${2:-default}" \
-        -H "Tags: ${3:-gear}" \
-        -d "$1" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1 || true
-}
-
-# Every stage announces itself three ways: the log, a one-line status file you
-# can cat, and a phone notification.
 log() {
     printf '\n[%s] == %s\n' "$(date -u +%H:%M:%S)" "$*"
     printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" > "$STATUS_FILE"
-    notify "$*"
 }
 
 on_error() {
     local rc=$? line=$1
     printf '\n!! FAILED (exit %s) at line %s\n' "$rc" "$line"
-    printf 'FAILED (exit %s) at line %s\n' "$rc" "$line" > "$STATUS_FILE"
-    notify "FAILED at line ${line} (exit ${rc})
-
-$(tail -n 12 "$LOG_FILE" 2>/dev/null)" urgent rotating_light
+    printf 'FAILED (exit %s) at line %s -- see %s\n' "$rc" "$line" "$LOG_FILE" > "$STATUS_FILE"
 }
 trap 'on_error $LINENO' ERR
+
+public_ip() {
+    curl -fsS --max-time 5 \
+        http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null \
+        || hostname -I | awk '{print $1}'
+}
 
 # ---------------------------------------------------------------- preflight
 
@@ -101,8 +90,7 @@ preflight() {
     echo "  free space on $DATA_DIR: ${avail_gb} GB"
     if (( avail_gb < 45 )); then
         echo "  WARNING: under 45 GB free. Peak need is ~35 GB (10 GB of .gz" >&2
-        echo "  dumps + ~5 GB CSVs + ~15 GB Neo4j store). Attach a volume or" >&2
-        echo "  resize before continuing." >&2
+        echo "  dumps + ~5 GB CSVs + ~15 GB Neo4j store)." >&2
     fi
 
     # A little swap keeps the importer from being OOM-killed on 8 GB boxes.
@@ -125,12 +113,11 @@ install_packages() {
     apt-get install -y -qq \
         python3 python3-pip python3-venv \
         openjdk-21-jre-headless \
-        git curl wget ca-certificates gnupg pv
+        git curl wget ca-certificates gnupg ufw
     python3 --version
 
     # The transform uses csv.QUOTE_STRINGS, added in Python 3.12. Ubuntu 24.04
-    # ships 3.12 as python3, so this should never fire -- but fail loudly rather
-    # than a few hours in.
+    # ships 3.12, so this should never fire -- but fail now, not hours in.
     python3 - <<'PY'
 import csv, sys
 if not hasattr(csv, "QUOTE_STRINGS"):
@@ -140,7 +127,7 @@ PY
 
 install_neo4j() {
     if have neo4j-admin; then
-        log "Neo4j already installed ($(neo4j-admin --version 2>/dev/null || echo unknown))"
+        log "Neo4j already installed"
         return
     fi
     log "Installing Neo4j 5 (Community)"
@@ -156,38 +143,17 @@ install_neo4j() {
     neo4j-admin --version
 }
 
-install_tailscale() {
-    [[ -n "$TAILSCALE_AUTHKEY" ]] || return 0
-    if ! have tailscale; then
-        log "Installing Tailscale"
-        curl -fsSL https://tailscale.com/install.sh | sh
-    fi
-    if ! tailscale status >/dev/null 2>&1; then
-        log "Joining tailnet"
-        # --ssh means you can also shell in from the Tailscale phone app with no
-        # keys to manage, which is the only practical SSH from a phone.
-        tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname=music-graph --ssh
-    fi
-    tailscale ip -4
-}
-
-configure_remote_access() {
-    [[ -n "$TAILSCALE_AUTHKEY" ]] || return 0
-    local ts_ip
-    ts_ip=$(tailscale ip -4 2>/dev/null | head -1) || return 0
-    [[ -n "$ts_ip" ]] || return 0
-
-    log "Binding Neo4j to the tailnet address $ts_ip"
-    # Bind to the tailnet interface specifically, never 0.0.0.0: the browser and
-    # bolt are then reachable from your own devices and from nowhere else, with
-    # no firewall rule to get wrong and no ports open to the internet.
-    local conf=/etc/neo4j/neo4j.conf
-    sed -i -E '/^(server\.default_listen_address|server\.bolt\.advertised_address|server\.http\.advertised_address)=/d' "$conf"
-    {
-        echo "server.default_listen_address=$ts_ip"
-        echo "server.bolt.advertised_address=$ts_ip:7687"
-        echo "server.http.advertised_address=$ts_ip:7474"
-    } >> "$conf"
+configure_firewall() {
+    log "Configuring firewall"
+    # Neo4j already binds localhost only; this is belt-and-braces so 7474/7687
+    # cannot be reached even if that changes.
+    ufw --force reset >/dev/null
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw allow 22/tcp >/dev/null
+    ufw allow "${APP_PORT}/tcp" >/dev/null
+    ufw --force enable >/dev/null
+    ufw status numbered
 }
 
 fetch_repo() {
@@ -201,6 +167,9 @@ fetch_repo() {
         git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
     fi
     pip3 install --quiet --break-system-packages -r "$REPO_DIR/requirements.txt"
+
+    log "Vendoring browser libraries"
+    "$REPO_DIR/fetch_vendor.sh"
 }
 
 # ---------------------------------------------------------------- dumps
@@ -226,7 +195,6 @@ download_dumps() {
         fi
 
         echo "  fetching $(basename "$f")"
-        # -C - resumes a partial download, so a dropped connection is cheap.
         curl -fL --retry 5 --retry-delay 10 -C - "$url" -o "$f" || {
             echo "  FAILED: $url" >&2
             echo "  Check the date exists and the URL pattern still holds:" >&2
@@ -257,8 +225,7 @@ run_transform() {
 
     log "Transforming dumps to import CSVs (the long step)"
     # The transform refuses a non-empty output folder, since its writers append.
-    rm -f "$CSV_DIR"/*.csv
-    rm -f "$DATA_DIR/labels.db"
+    rm -f "$CSV_DIR"/*.csv "$DATA_DIR/labels.db"
 
     # --release-xml streams the .gz directly, keeping only the ~3M releases that
     # are some master's main_release. No decompression, no index, one pass.
@@ -304,38 +271,97 @@ import_graph() {
     neo4j-admin dbms set-initial-password "$NEO4J_PASSWORD" 2>/dev/null \
         || echo "  password already set, leaving it alone"
 
-    configure_remote_access
-
     log "Starting Neo4j"
     systemctl start neo4j
-
-    # Poll whichever address Neo4j was actually bound to.
-    local host="localhost" i
-    if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
-        host=$(tailscale ip -4 2>/dev/null | head -1) || host="localhost"
-        [[ -n "$host" ]] || host="localhost"
-    fi
+    local i
     for i in $(seq 1 60); do
-        if curl -fsS -o /dev/null "http://${host}:7474/" 2>/dev/null; then
+        if curl -fsS -o /dev/null "http://localhost:7474/" 2>/dev/null; then
             echo "  up after $((i*10))s"; return 0
         fi
         sleep 10
     done
-    echo "  Neo4j did not answer on ${host}:7474 within 10 minutes" >&2
-    echo "  check: journalctl -u neo4j -n 50" >&2
+    echo "  Neo4j did not answer within 10 minutes -- journalctl -u neo4j -n 50" >&2
+    return 1
+}
+
+create_indexes() {
+    log "Creating full-text search index"
+    export NEO4J_USERNAME=neo4j NEO4J_PASSWORD
+    # The viewer searches through this index. A CONTAINS scan over ~15M nodes
+    # would not return in usable time.
+    cypher-shell -d "$DATABASE" \
+        "CREATE FULLTEXT INDEX entitySearch IF NOT EXISTS
+         FOR (n:Artist|Group|Release|Label) ON EACH [n.name, n.title];"
+    echo "  waiting for the index to come online (this can take a while)"
+    cypher-shell -d "$DATABASE" "CALL db.awaitIndexes(1800);"
+    cypher-shell -d "$DATABASE" "SHOW INDEXES YIELD name, state, type WHERE type = 'FULLTEXT';"
+}
+
+# ---------------------------------------------------------------- the app
+
+install_app() {
+    log "Installing the viewer service"
+
+    # Credentials live in a 600 env file rather than the unit, which is
+    # world-readable by default.
+    cat > "$ENV_FILE" <<EOF
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=${NEO4J_PASSWORD}
+NEO4J_DATABASE=${DATABASE}
+APP_USER=${APP_USER}
+APP_PASSWORD=${APP_PASSWORD}
+APP_PORT=${APP_PORT}
+APP_BIND=0.0.0.0
+EOF
+    chmod 600 "$ENV_FILE"
+
+    cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=Music Graph viewer
+After=neo4j.service
+Wants=neo4j.service
+
+[Service]
+Type=simple
+User=neo4j
+Group=neo4j
+EnvironmentFile=${ENV_FILE}
+ExecStart=/usr/bin/python3 ${REPO_DIR}/server.py
+Restart=on-failure
+RestartSec=5
+# Lets an unprivileged service bind port 80 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable music-graph >/dev/null 2>&1 || true
+    systemctl restart music-graph
+
+    local i
+    for i in $(seq 1 20); do
+        if curl -fsS -o /dev/null -u "${APP_USER}:${APP_PASSWORD}" \
+                "http://localhost:${APP_PORT}/api/stats" 2>/dev/null; then
+            echo "  viewer responding after ${i}s"; return 0
+        fi
+        sleep 1
+    done
+    echo "  viewer did not answer -- journalctl -u music-graph -n 50" >&2
     return 1
 }
 
 verify() {
     log "Verifying the graph"
-    # cypher-shell reads NEO4J_USERNAME/NEO4J_PASSWORD from the environment, so
-    # the password never appears in the process list or shell history.
     export NEO4J_USERNAME=neo4j NEO4J_PASSWORD
     cypher-shell -d "$DATABASE" \
-        "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS nodes ORDER BY nodes DESC;" \
-        || { echo "  could not query -- check: journalctl -u neo4j -n 50" >&2; return 1; }
+        "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS nodes ORDER BY nodes DESC;"
     cypher-shell -d "$DATABASE" \
-        "MATCH ()-[r]->() RETURN type(r) AS rel, count(*) AS count ORDER BY count DESC;" || true
+        "MATCH ()-[r]->() RETURN type(r) AS rel, count(*) AS count ORDER BY count DESC;"
 }
 
 # ---------------------------------------------------------------- main
@@ -344,36 +370,35 @@ main() {
     local started=$SECONDS
     preflight
     install_packages
-    install_tailscale
     install_neo4j
+    configure_firewall
     fetch_repo
     download_dumps
     run_transform
     import_graph
+    create_indexes
+    install_app
     verify
 
     local mins=$(( (SECONDS - started) / 60 ))
-    local where="an SSH tunnel:  ssh -N -L 7474:localhost:7474 -L 7687:localhost:7687 root@<droplet-ip>"
-    if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
-        where="http://$(tailscale ip -4 2>/dev/null | head -1):7474 from any device on your tailnet"
-    fi
+    local ip; ip=$(public_ip)
+    local url="http://${ip}"
+    [[ "$APP_PORT" == "80" ]] || url="http://${ip}:${APP_PORT}"
 
     printf '\n[%s] == Done in %s minutes\n' "$(date -u +%H:%M:%S)" "$mins"
-    printf 'DONE in %s minutes\n' "$mins" > "$STATUS_FILE"
-    notify "Import finished in ${mins} minutes.
-
-Neo4j Browser: ${where}
-User: neo4j
-
-Remember to destroy the droplet when you are done -- it bills hourly." default white_check_mark
+    printf 'DONE in %s minutes -- %s\n' "$mins" "$url" > "$STATUS_FILE"
 
     cat <<EOF
 
-Neo4j Browser: ${where}
-Log in as 'neo4j' with the password you set.
+    Viewer:   ${url}
+    Sign in:  ${APP_USER} / the APP_PASSWORD you set
 
-Nothing is exposed to the public internet: without Tailscale, Neo4j listens on
-localhost only; with it, on the tailnet address alone.
+Neo4j itself stays on localhost and is not reachable from outside; only the
+viewer port is open. The viewer is plain HTTP, so treat that password as
+throwaway and do not reuse it.
+
+Logs:   ${LOG_FILE}
+Status: ${STATUS_FILE}
 
 When you are finished, snapshot or destroy the droplet -- it bills by the hour.
 EOF

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A music knowledge graph built from [Discogs monthly data dumps](https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html). The Discogs XML dumps are transformed into CSVs for `neo4j-admin database import`, and a browser-based Sigma.js viewer explores the resulting graph with click-to-expand navigation and natural-language querying via a local Ollama model.
+A music knowledge graph built from [Discogs monthly data dumps](https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html). The Discogs XML dumps are transformed into CSVs for `neo4j-admin database import`, and a small Python server hosts a Sigma.js viewer that searches the graph through a full-text index and explores it by tapping nodes to pull in their neighbours.
 
 The engineering problem is scale: the releases dump is tens of GB of XML in one file, and masters reference releases by ID. The project went through three approaches to that random-access problem before arriving at the current one, which sidesteps it — see [Development history](#development-history).
 
@@ -16,7 +16,10 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 ├── sqlite_to_csv.py          # labels staging table -> labels.csv
 ├── dupe_finder.py            # pre-import check for duplicate node IDs
 ├── neo4j_admin_import.sh     # the bulk import itself
+├── server.py                 # HTTP front end: static viewer + JSON API
 ├── provision_droplet.sh      # unattended end-to-end run on a fresh droplet
+├── cloud-init.example.sh     # paste target for the DO "User data" box
+├── fetch_vendor.sh           # download the browser libs into web/vendor/
 ├── requirements.txt
 │
 │   # optional: build a reusable random-access index over the releases dump
@@ -25,11 +28,11 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 ├── merge_sqlite_releases.py  # merge per-chunk SQLite parts into one DB
 ├── optimise_sqlite_db.py     # ANALYZE the merged DB
 │
-└── web/                      # Sigma.js graph viewer
+└── web/                      # the viewer, served by server.py
     ├── index.html
-    ├── app.js                # KnowledgeGraphViewer: sigma + physics + Ollama
+    ├── app.js                # Viewer: sigma + force layout + API calls
     ├── styles.css
-    └── config.example.js     # copy to config.js and add credentials
+    └── vendor/               # graphology + sigma, fetched by fetch_vendor.sh
 ```
 
 Data is not in the repo. `.gitignore` excludes `data/`, XML, SQLite and CSV files.
@@ -61,9 +64,13 @@ python dupe_finder.py data/2025-08-01/artists.csv
 # 4. Bulk import (Neo4j must be stopped).
 ./neo4j_admin_import.sh data/2025-08-01 neo4j
 
-# 5. Serve the viewer.
-cp web/config.example.js web/config.js   # then fill in credentials
-cd web && python -m http.server 8000
+# 5. Create the full-text index the viewer searches through.
+cypher-shell -d neo4j "CREATE FULLTEXT INDEX entitySearch IF NOT EXISTS
+    FOR (n:Artist|Group|Release|Label) ON EACH [n.name, n.title];"
+
+# 6. Serve the viewer.
+./fetch_vendor.sh                             # once, populates web/vendor/
+NEO4J_PASSWORD=... APP_PASSWORD=... APP_PORT=8000 python server.py
 ```
 
 `--release-xml` works in two streaming passes. `collect_main_release_ids` reads the masters dump and collects the set of `main_release` IDs; `parse_releases_filtered` then streams the releases dump once, keeping only those. Roughly **3M of the ~18M releases** are ever wanted, so this reads the dump once instead of indexing all of it for random access.
@@ -138,26 +145,29 @@ Per entity in the default route: **Artists/Groups** XML → CSV directly; **Rele
 
 `provision_droplet.sh` does the whole thing unattended on a fresh Ubuntu 24.04 droplet: installs Java 21, Neo4j 5 and the Python deps, downloads and verifies the dumps, runs the prefilter route, imports, and reports node/relationship counts. Every step is idempotent, so it is safe to re-run after a disconnect.
 
+It ends by installing `music-graph.service`, a systemd unit running `server.py`, so the viewer is live at `http://<droplet-ip>/` when the run finishes.
+
 ### No-terminal route (works from a phone)
 
-`cloud-init.example.sh` is designed to be pasted into the DigitalOcean control panel's **User data** box when creating the droplet (Advanced Options → Add Initialization scripts). Fill in four values, create the droplet, and it provisions and imports on first boot. No SSH, no terminal at any point.
-
-Set `NTFY_TOPIC` and the run pushes a notification to your phone at every stage — via the free [ntfy](https://ntfy.sh) app, no account needed — with a loud one carrying the last dozen log lines if anything fails. Topics are public to whoever guesses the name, so make it long and random.
-
-Set `TAILSCALE_AUTHKEY` and the droplet joins your tailnet, with Neo4j bound to *the tailnet address only*. Neo4j Browser is then reachable at `http://<tailnet-ip>:7474` from your phone, with nothing exposed to the internet and no firewall rule to get wrong. `tailscale up --ssh` also means the Tailscale app gives you a shell without managing keys — the only practical SSH from a phone. Leave it empty and Neo4j stays on localhost.
-
-Progress is also written to `/var/log/music-graph.status` as a single line, so `cat` it for instant state without reading the log.
+`cloud-init.example.sh` is designed to be pasted into the DigitalOcean control panel's **User data** box when creating the droplet (Advanced Options → Add Initialization scripts). Fill in three values, create the droplet, and it provisions, imports and starts serving on first boot. No SSH, no terminal at any point.
 
 ### Terminal route
 
 ```bash
 export DUMP_DATE=20250801
 export NEO4J_PASSWORD='choose-something'
-export NTFY_TOPIC='something-unguessable'    # optional
+export APP_PASSWORD='choose-something-else'
 ./provision_droplet.sh
 ```
 
-Run interactively it tees to the terminal; unattended it redirects straight to `/var/log/music-graph.log`, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
+### Watching it
+
+Everything goes to disk:
+
+- `/var/log/music-graph.status` — one line, the current stage, or the failing line number and exit code
+- `/var/log/music-graph.log` — the full log
+
+Run interactively it tees to the terminal; unattended it redirects straight to the log file, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
 
 **Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Peak disk on the prefilter route is ~35 GB — 10 GB of `.gz` dumps, ~5 GB of CSVs, ~15 GB of Neo4j store — so no block-storage volume is needed. Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run that is destroyed afterward costs well under a pound. The index route would need a ~300 GB volume instead.
 
@@ -165,20 +175,42 @@ Going smaller than 8 GB is a false economy: `neo4j-admin import` gets tight on 4
 
 Two deployment notes baked into the script:
 
-- **It imports into the database named `neo4j`**, not `discogs`. Community Edition serves exactly one user database; importing into another name yields a database Neo4j will not start. It is also what the viewer's driver picks up by default.
-- **Nothing is exposed to the public internet.** Without Tailscale, Neo4j listens on localhost only, reachable via `ssh -N -L 7474:localhost:7474 -L 7687:localhost:7687 root@<ip>`. With Tailscale, it binds to the tailnet address alone — never `0.0.0.0`. The healthcheck polls whichever address was actually configured.
+- **It imports into the database named `neo4j`**, not `discogs`. Community Edition serves exactly one user database; importing into another name yields a database Neo4j will not start.
+- **Only the viewer port is exposed.** Neo4j stays on localhost and `ufw` allows just 22 and `APP_PORT`, so 7474/7687 are unreachable from outside even if the Neo4j config changes. The viewer is plain HTTP, so its basic-auth password crosses the wire in the clear — use a throwaway, and do not reuse the database password. `APP_PASSWORD` defaults to `NEO4J_PASSWORD` only so a run is not blocked on setting it.
+- **Credentials live in `/etc/music-graph.env`, mode 600**, not in the systemd unit, which is world-readable by default. The service runs as the unprivileged `neo4j` user with `AmbientCapabilities=CAP_NET_BIND_SERVICE` so it can bind port 80 without root.
 
 ## Web Interface
 
-`web/app.js` is a single `KnowledgeGraphViewer` class loading graphology, Sigma.js 2.4 and the Neo4j web driver from unpkg. No build step.
+Rebuilt from scratch. The original viewer opened a bolt connection **from the browser** with the password inlined in a JS file, asked Ollama to write Cypher, and interpolated user input into query strings — none of which survives being served on a public port.
 
-- **Querying.** `convertNaturalLanguageToCypher` has a regex fast-path that treats anything resembling a bare name as a substring search and skips the LLM; anything else goes to Ollama (`llama3.2`) with a schema prompt and few-shot examples, falling back to a hand-written `CONTAINS` query if Ollama is unreachable.
-- **Custom physics.** `updatePhysics` is hand-rolled rather than an off-the-shelf layout: mass-scaled inverse-square repulsion, spring attraction toward an ideal edge length of 100, a weak pull to the origin, velocity damping. `handleCollisions` adds O(n²) circle collision with positional separation and elastic impulse response.
-- **Degree drives appearance.** Queries return `count(DISTINCT ...) as <key>_degree`; `renderGraphData` picks up any key ending in `_degree`. Size is logarithmic, physics mass linear, so hubs are both bigger and harder to shove.
-- **Expansion.** Clicking a node runs `expandNode`, re-rendering additively with `parentNodeId` set so new neighbours spawn in a ring just outside the parent's radius. A `wasDragging` flag stops a drag registering as a click.
-- **Panning is off**, so dragging always means moving a node.
+### `server.py` — the front end
 
-The viewer was written against an early two-label graph and has **not** caught up with the schema. `getNodeColor` covers `Artist` and `Master` plus generic leftovers (`Person`, `Organization`, …), so `Group`, `Release` and `Label` render default grey. The Ollama prompt still describes the graph as containing "Artist and Master nodes", and the default query hardcodes `goldie`. `Master` no longer exists as a node at all.
+A single-file HTTP server: static files from `web/`, plus a three-endpoint JSON API. All Cypher lives here, is parameterised, and only reads. The browser never sees database credentials and cannot submit a query of its own.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/stats` | per-label totals |
+| `GET /api/search?q=&limit=` | seed nodes matching the term, with their immediate edges |
+| `GET /api/expand?id=&limit=` | neighbours of one node, by `elementId` |
+
+- **Search goes through a full-text index** (`entitySearch`). A `CONTAINS` scan over ~15M nodes would never return in usable time. The search term is the only user text that reaches the database as anything but a bound parameter, so `clean_term` strips Lucene operators before it gets there.
+- **`stats` counts one label at a time** (`MATCH (n:Artist) RETURN count(n)`), which hits Neo4j's count store and is O(1) rather than scanning.
+- **HTTP basic auth** guards everything, compared with `hmac.compare_digest`. Set `APP_ALLOW_ANONYMOUS=1` to disable it for local use.
+- **Limits are clamped** to `MAX_LIMIT` (300) server-side, and profile text is truncated to 600 characters — Discogs profiles run to thousands of words.
+
+### `web/app.js` — the viewer
+
+- **Layout is Fruchterman–Reingold with a cooling schedule**, run in animation-frame batches. The view is capped at a few hundred nodes so O(n²) repulsion is free and Barnes–Hut is not worth a dependency. Cooling is what the original lacked: it ran a constant-energy simulation forever with elastic collision impulses fighting the springs, so hub-heavy subgraphs jittered indefinitely instead of settling.
+- **Colour by node type**, all four of them, with a legend: Artist blue, Group violet, Release rose, Label green. Sigma renders a node's `label` attribute, so the *type* is stored separately as `kind` — writing the title into `label` is what the display needs, and reading the type back out of it is a mistake worth not repeating.
+- **Size by degree within the visible subgraph**, logarithmic. Using true global degree would let a hub like "Various" swamp everything.
+- **Tap to select** (opens the detail panel), **tap Expand** to pull in neighbours, which merge into the existing graph rather than replacing it. Already-expanded nodes are tracked so the button disappears.
+- **Built for a phone**: 390px-wide layout tested in Chromium, 16px inputs so iOS does not zoom on focus, `touch-action: none` so sigma owns pan/zoom gestures, and the panel docks to the bottom under 560px.
+
+### Vendored libraries
+
+`graphology` and `sigma` are downloaded into `web/vendor/` by `fetch_vendor.sh` rather than loaded from a CDN, so the page works on flaky mobile data. `web/vendor/` is gitignored; provisioning runs the script automatically.
+
+Note that `graphology-layout-forceatlas2` **has no UMD build** in its npm package, so the obvious unpkg path for it 404s — that is why the layout is implemented directly rather than pulled in.
 
 ## Development history
 
@@ -211,10 +243,9 @@ The arc: naive parse → generalise → ripgrep → binary search → SQLite ind
 - **`open_writer` appends.** CSVs open in `"a"` mode with the header re-written per call, so re-running into a folder holding output duplicates every row and injects headers mid-file. `discogs_to_neo4j.py` **refuses to start** if the output folder contains any `.csv`. The append mode itself is unchanged — switching to `"w"` would clobber output on partial re-runs, so the guard is deliberately a refusal.
 - **`labels.csv` is written twice.** The transform creates a header-only placeholder whenever `--label-xml` is given; `sqlite_to_csv.py` overwrites it with the real export. Skipping that second step leaves an empty label set and dangling `RELEASED_ON` edges.
 - **Sublabels can dangle.** Sublabels go into `label_sublabel_links.csv` but not `labels.csv`, assuming every sublabel also appears as a top-level `<label>`. True for full dumps, not partial ones; add `--skip-bad-relationships=true` if the import aborts on these.
-- **`expandNode` interpolates `id(center) = ${nodeId}` into Cypher**, and the name fast-path interpolates user input into a string literal. Fine for a local single-user tool, not safe to expose.
-- **`id()` is deprecated** in current Neo4j in favour of `elementId()`; the viewer relies on `identity`/`id()` throughout.
-- **Viewer colours are incomplete** — see Web Interface.
+- **The full-text index must exist** before search works. `provision_droplet.sh` creates it and waits via `db.awaitIndexes`; building it over ~15M nodes takes a while. Without it, `/api/search` returns a "query failed" error.
 - **Dump URL pattern is unverified** from the sandbox this was written in (egress policy blocked the bucket). `provision_droplet.sh` fails loudly with the index URL if a download 404s.
+- **The viewer is plain HTTP.** Fine for a throwaway droplet; put it behind a TLS terminator before treating it as anything more.
 
 ### Fixed along the way
 
@@ -232,14 +263,15 @@ Non-obvious symptoms, recorded in case you hit them in an older checkout:
 ## Dependencies and Services
 
 ### Python 3.12+
-`pip install -r requirements.txt` — `lxml`, `click`, `alive_progress`. The two XML libraries are not interchangeable: `discogs_to_neo4j.py` needs `lxml` for `getparent()`/`xpath()`, while `releases_to_sqlite.py` uses stdlib `ElementTree`.
+`pip install -r requirements.txt` — `lxml`, `click`, `alive_progress` for the pipeline, `neo4j` for `server.py`. The two XML libraries are not interchangeable: `discogs_to_neo4j.py` needs `lxml` for `getparent()`/`xpath()`, while `releases_to_sqlite.py` uses stdlib `ElementTree`.
 
 ### External services
 - **Neo4j 5** (needs Java 17 or 21) on `bolt://localhost:7687`. Must be **stopped** for `neo4j-admin database import`.
-- **Ollama** on `http://localhost:11434` serving `llama3.2`, for natural-language → Cypher. Optional; the viewer degrades to a substring query without it.
 
-### Web (unpkg CDN, no build step)
-graphology 0.25.4, Sigma.js 2.4.0, neo4j-driver 5.12.0.
+Ollama is no longer used. The rebuilt viewer searches a full-text index instead of asking an LLM to write Cypher.
+
+### Web (vendored, no build step)
+graphology 0.25.4 and Sigma.js 2.4.0 in `web/vendor/`, fetched by `fetch_vendor.sh`. No CDN at runtime, no browser-side database driver.
 
 ### Credentials
-`web/config.js` is gitignored; copy `web/config.example.js` and fill in `neo4jPassword`. `app.js` reads `window.MUSIC_GRAPH_CONFIG` and errors if no password is set. Do not hardcode credentials back into `app.js` — an earlier revision did, and the password was scrubbed when this repo was first pushed.
+`server.py` reads `NEO4J_PASSWORD` and `APP_PASSWORD` from the environment; provisioning puts them in `/etc/music-graph.env` at mode 600. Nothing credential-bearing is served to the browser. Do not reintroduce credentials into `web/` — the original `app.js` hardcoded the Neo4j password, and it had to be scrubbed when this repo was first pushed.
