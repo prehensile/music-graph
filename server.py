@@ -48,6 +48,13 @@ APP_USER = os.environ.get("APP_USER", "music")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 APP_ALLOW_ANONYMOUS = os.environ.get("APP_ALLOW_ANONYMOUS") == "1"
 
+# Written by provision_droplet.sh. Read-only here.
+LOG_FILE = os.environ.get("LOG_FILE", "/var/log/music-graph.log")
+STATUS_FILE = os.environ.get("STATUS_FILE", "/var/log/music-graph.status")
+STEPS_FILE = os.environ.get("STEPS_FILE", "/var/log/music-graph.steps.jsonl")
+LOG_TAIL_BYTES = 64 * 1024
+LOG_TAIL_LINES = 200
+
 NODE_LABELS = ("Artist", "Group", "Release", "Label")
 
 # Lucene reserved characters. The full-text index is the only place user text
@@ -67,6 +74,70 @@ def clamp_limit(raw, default=60):
         return max(1, min(MAX_LIMIT, int(raw)))
     except (TypeError, ValueError):
         return default
+
+
+def tail_lines(path, max_bytes=LOG_TAIL_BYTES, max_lines=LOG_TAIL_LINES):
+    """Last lines of a file, without reading the whole thing into memory."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()          # discard the partial first line
+            data = fh.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", "replace")
+    return [ln for ln in text.splitlines() if ln.strip()][-max_lines:]
+
+
+def read_progress():
+    """
+    Assemble the provisioning state from the files the shell script writes.
+
+    Deliberately touches no database: this is the one view that has to work
+    while the import is still running, and before Neo4j has anything in it.
+    """
+    steps, seen = [], {}
+    try:
+        with open(STEPS_FILE, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                # Later records for a step supersede earlier ones, so a step
+                # goes running -> done/failed in place.
+                seen[rec.get("n")] = rec
+    except OSError:
+        pass
+    steps = [seen[k] for k in sorted(seen)]
+
+    status = ""
+    try:
+        with open(STATUS_FILE, "r", encoding="utf-8", errors="replace") as fh:
+            status = fh.read().strip()
+    except OSError:
+        pass
+
+    total = steps[0].get("of") if steps else 0
+    done = sum(1 for s in steps if s.get("state") == "done")
+    failed = any(s.get("state") == "failed" for s in steps)
+    running = next((s for s in steps if s.get("state") == "running"), None)
+
+    return {
+        "status": status,
+        "steps": steps,
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "running": running,
+        "finished": bool(total) and done >= total and not failed,
+        "log": tail_lines(LOG_FILE),
+    }
 
 
 class Graph:
@@ -98,7 +169,11 @@ class Graph:
             for label in NODE_LABELS:
                 rows = self._run(f"MATCH (n:{label}) RETURN count(n) AS c")
                 counts[label] = rows[0]["c"] if rows else 0
-            self._stats_cache = counts
+            # Only cache a populated result. The service starts before the
+            # import, so an all-zero answer here is "not loaded yet", not a
+            # fact worth remembering for the life of the process.
+            if any(counts.values()):
+                self._stats_cache = counts
             return counts
 
     def search(self, term, limit):
@@ -220,13 +295,31 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
+
+        # /logs is a page, not a directory; map it onto the static file.
+        if parsed.path in ("/logs", "/logs/"):
+            self.path = "/logs.html"
+            return super().do_GET()
+
         if not parsed.path.startswith("/api/"):
             return super().do_GET()
+
+        # Served before anything else, and without touching the database: this
+        # is what you watch while the import is still running.
+        if parsed.path == "/api/progress":
+            return self._send_json(read_progress())
 
         query = parse_qs(parsed.query)
         try:
             if parsed.path == "/api/stats":
-                self._send_json(self.graph.stats())
+                # An unreachable or empty database is the normal state until
+                # the import lands, not a server error. Answer 200 with empty
+                # counts and let the page point the reader at /logs.
+                try:
+                    self._send_json(self.graph.stats())
+                except Exception as exc:
+                    sys.stderr.write(f"stats unavailable: {exc!r}\n")
+                    self._send_json({})
             elif parsed.path == "/api/search":
                 self._send_json(self.graph.search(
                     query.get("q", [""])[0],

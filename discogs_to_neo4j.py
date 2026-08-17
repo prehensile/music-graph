@@ -4,10 +4,11 @@ import os
 import csv
 import gzip
 import time
-from alive_progress import alive_bar
 import traceback
 import click
 import sqlite3
+
+from progress import Heartbeat, format_duration
 
 
 from lxml.etree import Element
@@ -277,14 +278,6 @@ def process_master( element: Element, writers, xml_files, sqlite_files ):
 
 
 
-def format_eta( eta_seconds ):
-    if eta_seconds < 60:
-        return f"{eta_seconds:.0f}s"
-    if eta_seconds < 3600:
-        return f"{eta_seconds//60:.0f}m {eta_seconds%60:.0f}s"
-    return f"{eta_seconds//3600:.0f}h {(eta_seconds%3600)//60:.0f}m"
-
-
 def open_dump( fn ):
     """
     Open a Discogs dump for streaming, transparently handling gzip.
@@ -311,52 +304,40 @@ def stream_elements( fn_xml, tag, on_element ):
     a gigabyte across a full releases dump.
     """
     parse_fp, progress_fp, total_bytes = open_dump( fn_xml )
-    start_time = time.time()
-    num_records = 0
     num_errors = 0
+
+    # Progress is measured in bytes of the file consumed, so it stays accurate
+    # regardless of how many records a dump happens to hold.
+    beat = Heartbeat( tag, total=total_bytes, unit=f"{tag}s" )
+    beat.begin( f"{os.path.basename(fn_xml)} ({total_bytes/2**30:.2f} GiB)" )
 
     try:
         context = et.iterparse( parse_fp, events=("end",), tag=tag )
 
-        with alive_bar(dual_line=True, receipt_text=True) as bar:
-            for event, element in context:
+        for event, element in context:
 
-                try:
-                    on_element( element )
-                except AttributeError as e:
-                    print( et.tostring(element) )
-                    print( repr(e) )
-                    num_errors += 1
+            try:
+                on_element( element )
+            except AttributeError as e:
+                print( et.tostring(element) )
+                print( repr(e) )
+                num_errors += 1
 
-                num_records += 1
+            parent = element.getparent()
+            element.clear()
+            if parent is not None:
+                while element.getprevious() is not None:
+                    del parent[0]
 
-                parent = element.getparent()
-                element.clear()
-                if parent is not None:
-                    while element.getprevious() is not None:
-                        del parent[0]
-
-                # Progress is updated per matched element rather than per XML
-                # event: on a releases dump the latter fires over a billion
-                # times and the bookkeeping alone costs hours.
-                current_pos = progress_fp.tell()
-                pc = (current_pos / total_bytes) * 100
-                elapsed_time = time.time() - start_time
-                if pc > 0 and elapsed_time > 0:
-                    bytes_per_second = current_pos / elapsed_time
-                    eta_seconds = (total_bytes - current_pos) / bytes_per_second
-                    bar.text(f"{pc:.2f}% of {os.path.basename(fn_xml)} (ETA: {format_eta(eta_seconds)})")
-                else:
-                    bar.text(f"{pc:.2f}% of {os.path.basename(fn_xml)}")
-                bar()
+            beat.tick( position=progress_fp.tell() )
     finally:
         parse_fp.close()
         if progress_fp is not parse_fp:
             progress_fp.close()
 
+    num_records = beat.count
     error_rate = (num_errors / num_records * 100) if num_records else 0.0
-    print(f"Processed {num_records:,} {tag} with {num_errors:,} errors "
-          f"({error_rate:.4f}% error rate)")
+    beat.finish( f"{num_errors:,} errors ({error_rate:.4f}%)" )
     return num_records
 
 

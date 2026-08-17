@@ -43,8 +43,28 @@ BASE_URL="https://discogs-data-dumps.s3.us-west-2.amazonaws.com/data/${DUMP_YEAR
 
 LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
 STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
+STEPS_FILE="${STEPS_FILE:-/var/log/music-graph.steps.jsonl}"
 ENV_FILE=/etc/music-graph.env
 UNIT_FILE=/etc/systemd/system/music-graph.service
+
+# Named here so the count is right in the UI before any of them have run.
+STEP_NAMES=(
+    "Preflight"
+    "Installing base packages"
+    "Installing Neo4j"
+    "Configuring firewall"
+    "Fetching repo and dependencies"
+    "Starting the viewer service"
+    "Downloading Discogs dumps"
+    "Transforming dumps to CSV"
+    "Importing into Neo4j"
+    "Building the search index"
+    "Verifying the graph"
+)
+TOTAL_STEPS=${#STEP_NAMES[@]}
+STEP_NUM=0
+STEP_NAME=""
+STEP_START=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -66,10 +86,35 @@ log() {
     printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" > "$STATUS_FILE"
 }
 
+# One JSON object per line, appended as each step starts and ends. The web
+# server reads this to render a checklist; a flat file needs no coordination
+# between the two processes and survives either being restarted.
+emit_step() {
+    local state="$1"
+    printf '{"n":%d,"of":%d,"name":"%s","state":"%s","elapsed":%d,"ts":"%s"}\n' \
+        "$STEP_NUM" "$TOTAL_STEPS" "$STEP_NAME" "$state" \
+        "$(( SECONDS - STEP_START ))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        >> "$STEPS_FILE"
+    chmod 644 "$STEPS_FILE" 2>/dev/null || true
+}
+
+# Run one named step, bracketing it with progress records.
+step() {
+    local fn="$1"
+    STEP_NUM=$(( STEP_NUM + 1 ))
+    STEP_NAME="${STEP_NAMES[$(( STEP_NUM - 1 ))]}"
+    STEP_START=$SECONDS
+    emit_step "running"
+    log "[${STEP_NUM}/${TOTAL_STEPS}] ${STEP_NAME}"
+    "$fn"
+    emit_step "done"
+}
+
 on_error() {
     local rc=$? line=$1
     printf '\n!! FAILED (exit %s) at line %s\n' "$rc" "$line"
     printf 'FAILED (exit %s) at line %s -- see %s\n' "$rc" "$line" "$LOG_FILE" > "$STATUS_FILE"
+    [[ -n "$STEP_NAME" ]] && emit_step "failed"
 }
 trap 'on_error $LINENO' ERR
 
@@ -82,7 +127,6 @@ public_ip() {
 # ---------------------------------------------------------------- preflight
 
 preflight() {
-    log "Preflight"
     mkdir -p "$DATA_DIR" "$CSV_DIR"
 
     local avail_gb
@@ -109,7 +153,6 @@ preflight() {
 # ---------------------------------------------------------------- packages
 
 install_packages() {
-    log "Installing base packages"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq \
@@ -129,10 +172,10 @@ PY
 
 install_neo4j() {
     if have neo4j-admin; then
-        log "Neo4j already installed"
+        echo "  already installed"
         return
     fi
-    log "Installing Neo4j 5 (Community)"
+    echo "  installing Neo4j 5 Community"
     mkdir -p /etc/apt/keyrings
     wget -qO - https://debian.neo4j.com/neotechnology.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/neotechnology.gpg
@@ -146,7 +189,6 @@ install_neo4j() {
 }
 
 configure_firewall() {
-    log "Configuring firewall"
     # Neo4j already binds localhost only; this is belt-and-braces so 7474/7687
     # cannot be reached even if that changes.
     ufw --force reset >/dev/null
@@ -160,12 +202,12 @@ configure_firewall() {
 
 fetch_repo() {
     if [[ -d "$REPO_DIR/.git" ]]; then
-        log "Updating repo in $REPO_DIR"
+        echo "  updating repo in $REPO_DIR"
         git -C "$REPO_DIR" fetch --quiet origin "$REPO_BRANCH"
         git -C "$REPO_DIR" checkout --quiet "$REPO_BRANCH"
         git -C "$REPO_DIR" reset --hard --quiet "origin/$REPO_BRANCH"
     else
-        log "Cloning $REPO_URL"
+        echo "  cloning $REPO_URL"
         git clone --quiet --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"
     fi
     pip3 install --quiet --break-system-packages -r "$REPO_DIR/requirements.txt"
@@ -177,7 +219,6 @@ fetch_repo() {
 # ---------------------------------------------------------------- dumps
 
 download_dumps() {
-    log "Downloading dumps for $DUMP_DATE"
     local checksums="$DATA_DIR/discogs_${DUMP_DATE}_CHECKSUM.txt"
 
     if [[ ! -s "$checksums" ]]; then
@@ -252,7 +293,6 @@ run_transform() {
         return
     fi
 
-    log "Transforming dumps to import CSVs (the long step)"
     # The transform refuses a non-empty output folder, since its writers append.
     rm -f "$CSV_DIR"/*.csv "$DATA_DIR/labels.db"
 
@@ -284,7 +324,6 @@ run_transform() {
 # ---------------------------------------------------------------- import
 
 import_graph() {
-    log "Importing into Neo4j database '$DATABASE'"
     systemctl stop neo4j 2>/dev/null || true
 
     # neo4j-admin runs as the neo4j user and must be able to read the CSVs, which
@@ -314,7 +353,6 @@ import_graph() {
 }
 
 create_indexes() {
-    log "Creating full-text search index"
     export NEO4J_USERNAME=neo4j NEO4J_PASSWORD
     # The viewer searches through this index. A CONTAINS scan over ~15M nodes
     # would not return in usable time.
@@ -329,7 +367,6 @@ create_indexes() {
 # ---------------------------------------------------------------- the app
 
 install_app() {
-    log "Installing the viewer service"
 
     # Credentials live in a 600 env file rather than the unit, which is
     # world-readable by default.
@@ -342,14 +379,23 @@ APP_USER=${APP_USER}
 APP_PASSWORD=${APP_PASSWORD}
 APP_PORT=${APP_PORT}
 APP_BIND=0.0.0.0
+LOG_FILE=${LOG_FILE}
+STATUS_FILE=${STATUS_FILE}
+STEPS_FILE=${STEPS_FILE}
 EOF
     chmod 600 "$ENV_FILE"
+
+    # The service runs as neo4j and reads these to render /logs.
+    touch "$LOG_FILE" "$STATUS_FILE" "$STEPS_FILE"
+    chmod 644 "$LOG_FILE" "$STATUS_FILE" "$STEPS_FILE"
 
     cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=Music Graph viewer
+# After, but deliberately not Wants: the service comes up before the import and
+# must not drag Neo4j up with it, since neo4j-admin needs Neo4j stopped. The
+# viewer tolerates the database being absent and says so on /logs.
 After=neo4j.service
-Wants=neo4j.service
 
 [Service]
 Type=simple
@@ -372,11 +418,15 @@ EOF
     systemctl enable music-graph >/dev/null 2>&1 || true
     systemctl restart music-graph
 
+    # Probe /api/progress, not /api/stats: this runs before the import, so the
+    # graph endpoints cannot succeed yet. /api/progress only reads log files.
     local i
     for i in $(seq 1 20); do
         if curl -fsS -o /dev/null -u "${APP_USER}:${APP_PASSWORD}" \
-                "http://localhost:${APP_PORT}/api/stats" 2>/dev/null; then
-            echo "  viewer responding after ${i}s"; return 0
+                "http://localhost:${APP_PORT}/api/progress" 2>/dev/null; then
+            echo "  viewer responding after ${i}s"
+            echo "  progress page: http://$(public_ip)/logs"
+            return 0
         fi
         sleep 1
     done
@@ -385,7 +435,6 @@ EOF
 }
 
 verify() {
-    log "Verifying the graph"
     export NEO4J_USERNAME=neo4j NEO4J_PASSWORD
     cypher-shell -d "$DATABASE" \
         "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS nodes ORDER BY nodes DESC;"
@@ -397,17 +446,40 @@ verify() {
 
 main() {
     local started=$SECONDS
-    preflight
-    install_packages
-    install_neo4j
-    configure_firewall
-    fetch_repo
-    download_dumps
-    run_transform
-    import_graph
-    create_indexes
-    install_app
-    verify
+    : > "$STEPS_FILE"
+    chmod 644 "$STEPS_FILE" "$LOG_FILE" "$STATUS_FILE" 2>/dev/null || true
+
+    # Seed a pending record for every step so the progress page can show the
+    # whole checklist by name from the outset, rather than the list growing as
+    # the run proceeds. Later records for a step supersede these.
+    local i
+    for i in "${!STEP_NAMES[@]}"; do
+        STEP_NUM=$(( i + 1 ))
+        STEP_NAME="${STEP_NAMES[$i]}"
+        STEP_START=$SECONDS
+        emit_step "pending"
+    done
+    STEP_NUM=0
+    STEP_NAME=""
+
+    step preflight
+    step install_packages
+    step install_neo4j
+    step configure_firewall
+    step fetch_repo
+    # Deliberately before the slow steps: this brings up /logs, so the rest of
+    # the run can be watched from a browser. The graph endpoints stay broken
+    # until the import lands, which the progress page says plainly.
+    step install_app
+    step download_dumps
+    step run_transform
+    step import_graph
+    step create_indexes
+    step verify
+
+    # The stats endpoint caches its counts, and the service has been up since
+    # before the import. Restart so it reports the populated graph.
+    systemctl restart music-graph
 
     local mins=$(( (SECONDS - started) / 60 ))
     local ip; ip=$(public_ip)

@@ -4,8 +4,9 @@ import sqlite3
 import os
 import glob
 import time
-from alive_progress import alive_bar
 import click
+
+from progress import Heartbeat
 
 def get_row_count(db_path):
     """Get total number of rows in a database"""
@@ -36,69 +37,46 @@ def merge_databases_streaming(part_dbs, output_db, batch_size=10000):
     total_rows = sum(get_row_count(db) for db in part_dbs)
     print(f"Merging {len(part_dbs)} databases with {total_rows:,} total rows")
     
-    processed_rows = 0
     start_time = time.time()
-    
-    with alive_bar(total_rows, dual_line=True, receipt_text=True) as bar:
-        
-        for part_db in part_dbs:
-            print(f"Processing {os.path.basename(part_db)}...")
-            
-            # Open source database
-            source_conn = sqlite3.connect(part_db)
-            source_conn.row_factory = sqlite3.Row  # Enable dict-like access
-            source_cursor = source_conn.cursor()
-            
-            # Stream data in batches
-            offset = 0
-            while True:
-                # Fetch batch from source
-                source_cursor.execute(
-                    "SELECT id, content FROM releases LIMIT ? OFFSET ?", 
-                    (batch_size, offset)
-                )
-                batch = source_cursor.fetchall()
-                
-                if not batch:
-                    break
-                
-                # Insert batch into output database
-                batch_data = [(row['id'], row['content']) for row in batch]
-                output_cursor.executemany(
-                    "INSERT OR REPLACE INTO releases (id, content) VALUES (?, ?)",
-                    batch_data
-                )
-                output_conn.commit()
-                
-                # Update progress
-                batch_count = len(batch)
-                processed_rows += batch_count
-                offset += batch_size
-                
-                # Calculate ETA
-                elapsed_time = time.time() - start_time
-                if processed_rows > 0 and elapsed_time > 0:
-                    rows_per_second = processed_rows / elapsed_time
-                    remaining_rows = total_rows - processed_rows
-                    eta_seconds = remaining_rows / rows_per_second
-                    
-                    if eta_seconds < 60:
-                        eta_str = f"{eta_seconds:.0f}s"
-                    elif eta_seconds < 3600:
-                        eta_str = f"{eta_seconds//60:.0f}m {eta_seconds%60:.0f}s"
-                    else:
-                        eta_str = f"{eta_seconds//3600:.0f}h {(eta_seconds%3600)//60:.0f}m"
-                    
-                    bar.text(f"Processed {processed_rows:,}/{total_rows:,} rows (ETA: {eta_str})")
-                else:
-                    bar.text(f"Processed {processed_rows:,}/{total_rows:,} rows")
-                
-                # Update progress bar
-                for _ in range(batch_count):
-                    bar()
-            
-            source_conn.close()
-    
+    beat = Heartbeat("merge", total=total_rows, unit="rows")
+    beat.begin(f"{len(part_dbs)} databases")
+
+    for part_db in part_dbs:
+        print(f"Processing {os.path.basename(part_db)}...")
+
+        # Open source database
+        source_conn = sqlite3.connect(part_db)
+        source_conn.row_factory = sqlite3.Row  # Enable dict-like access
+        source_cursor = source_conn.cursor()
+
+        # Stream data in batches
+        offset = 0
+        while True:
+            # Fetch batch from source
+            source_cursor.execute(
+                "SELECT id, content FROM releases LIMIT ? OFFSET ?",
+                (batch_size, offset)
+            )
+            batch = source_cursor.fetchall()
+
+            if not batch:
+                break
+
+            # Insert batch into output database
+            batch_data = [(row['id'], row['content']) for row in batch]
+            output_cursor.executemany(
+                "INSERT OR REPLACE INTO releases (id, content) VALUES (?, ?)",
+                batch_data
+            )
+            output_conn.commit()
+
+            offset += batch_size
+            beat.tick(count=beat.count + len(batch))
+
+        source_conn.close()
+
+    beat.finish()
+
     # Optimize final database
     print("Optimizing database...")
     output_cursor.execute("VACUUM")

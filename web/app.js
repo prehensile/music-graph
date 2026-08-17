@@ -109,14 +109,22 @@ class Viewer {
   }
 
   async loadStats() {
+    // The server is up before the import finishes, so "no graph yet" is an
+    // expected state rather than an error -- point at the progress page
+    // instead of failing silently.
+    const notReady = () => {
+      $('counts').innerHTML = 'graph not loaded yet — <a href="/logs">see progress</a>';
+      $('hint').innerHTML = '<p>The graph has not been built yet.</p>'
+        + '<p class="muted"><a href="/logs">Watch the build progress</a></p>';
+    };
     try {
       const stats = await this.api('/api/stats');
       const total = Object.values(stats).reduce((a, b) => a + b, 0);
-      $('counts').textContent = total
-        ? Object.entries(stats).map(([k, v]) => `${v.toLocaleString()} ${k}`).join(' · ')
-        : 'empty graph';
+      if (!total) return notReady();
+      $('counts').textContent = Object.entries(stats)
+        .map(([k, v]) => `${v.toLocaleString()} ${k}`).join(' · ');
     } catch (_) {
-      $('counts').textContent = '';
+      notReady();
     }
   }
 

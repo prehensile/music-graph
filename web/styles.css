@@ -244,6 +244,8 @@ footer {
 }
 
 #counts { margin-left: auto; }
+#counts a, .overlay a { color: var(--accent); }
+footer a.linkish { text-decoration: underline; }
 
 /* ------------------------------------------------------------------- toast */
 

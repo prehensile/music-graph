@@ -15,6 +15,7 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 ├── discogs_to_neo4j.py       # the transform: XML dumps -> Neo4j import CSVs
 ├── sqlite_to_csv.py          # labels staging table -> labels.csv
 ├── dupe_finder.py            # pre-import check for duplicate node IDs
+├── progress.py               # periodic plain-text progress lines
 ├── neo4j_admin_import.sh     # the bulk import itself
 ├── server.py                 # HTTP front end: static viewer + JSON API
 ├── provision_droplet.sh      # unattended end-to-end run on a fresh droplet
@@ -31,6 +32,7 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 └── web/                      # the viewer, served by server.py
     ├── index.html
     ├── app.js                # Viewer: sigma + force layout + API calls
+    ├── logs.html             # build-progress page, served at /logs
     ├── styles.css
     └── vendor/               # graphology + sigma, fetched by fetch_vendor.sh
 ```
@@ -162,12 +164,29 @@ export APP_PASSWORD='choose-something-else'
 
 ### Watching it
 
-Everything goes to disk:
+**The viewer serves a progress page at `/logs`.** The service is deliberately started *before* the slow steps, so the whole run can be watched from a browser: a step checklist with timings, a progress bar, and a live tail of the log, polled every 4 seconds. The graph endpoints stay broken until the import lands, and the page and the viewer both say so rather than failing silently.
 
-- `/var/log/music-graph.status` — one line, the current stage, or the failing line number and exit code
-- `/var/log/music-graph.log` — the full log
+Everything is on disk too:
 
-Run interactively it tees to the terminal; unattended it redirects straight to the log file, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
+| | |
+|---|---|
+| `/var/log/music-graph.status` | one line — current stage, or the failing line number and exit code |
+| `/var/log/music-graph.steps.jsonl` | one JSON object per step transition (`pending`/`running`/`done`/`failed`) |
+| `/var/log/music-graph.log` | the full log |
+
+The steps file is append-only, one record per transition, with later records superseding earlier ones for the same step number. A flat file needs no coordination between the shell script and the web server, and survives either being restarted. `main()` seeds a `pending` record for every step up front so the page shows the full checklist by name from the start rather than growing as the run proceeds.
+
+Run interactively the script tees to the terminal; unattended it redirects straight to the log file, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
+
+### Progress reporting in the Python scripts
+
+`progress.py` prints a plain line every `PROGRESS_INTERVAL` seconds (default 30, `0` to silence). This replaced `alive_progress`, which was a poor fit here on three counts: it redraws with control characters aimed at a terminal, it hooks `sys.stdout` so anything printed inside its context gets rewritten with an `on <n>:` prefix, and it costs per record — roughly 1.2 µs of formatting plus a bar call, about 40 seconds across a full releases dump. A timestamped line behaves the same whether or not anyone is watching, greps cleanly, and reads well in the `/logs` pane.
+
+```
+  [release]  63.1% | 11,383,204 releases | 18,941/s | ETA 21m 14s
+```
+
+`Heartbeat` measures progress in whatever unit you give it — bytes consumed when streaming a file, rows when draining a query — so percentages stay accurate regardless of record count.
 
 **Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run destroyed afterwards costs well under a pound.
 
@@ -204,6 +223,7 @@ A single-file HTTP server: static files from `web/`, plus a three-endpoint JSON 
 | `GET /api/stats` | per-label totals |
 | `GET /api/search?q=&limit=` | seed nodes matching the term, with their immediate edges |
 | `GET /api/expand?id=&limit=` | neighbours of one node, by `elementId` |
+| `GET /api/progress` | provisioning steps, status and log tail — reads files only, never the database |
 
 - **Search goes through a full-text index** (`entitySearch`). A `CONTAINS` scan over ~15M nodes would never return in usable time. The search term is the only user text that reaches the database as anything but a bound parameter, so `clean_term` strips Lucene operators before it gets there.
 - **`stats` counts one label at a time** (`MATCH (n:Artist) RETURN count(n)`), which hits Neo4j's count store and is O(1) rather than scanning.
@@ -275,7 +295,7 @@ Non-obvious symptoms, recorded in case you hit them in an older checkout:
 ## Dependencies and Services
 
 ### Python 3.12+
-`pip install -r requirements.txt` — `lxml`, `click`, `alive_progress` for the pipeline, `neo4j` for `server.py`. The two XML libraries are not interchangeable: `discogs_to_neo4j.py` needs `lxml` for `getparent()`/`xpath()`, while `releases_to_sqlite.py` uses stdlib `ElementTree`.
+`pip install -r requirements.txt` — `lxml` and `click` for the pipeline, `neo4j` for `server.py`. Progress reporting is `progress.py`, no dependency. The two XML libraries are not interchangeable: `discogs_to_neo4j.py` needs `lxml` for `getparent()`/`xpath()`, while `releases_to_sqlite.py` uses stdlib `ElementTree`.
 
 ### External services
 - **Neo4j 5** (needs Java 17 or 21) on `bolt://localhost:7687`. Must be **stopped** for `neo4j-admin database import`.
