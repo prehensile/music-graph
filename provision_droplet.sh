@@ -8,7 +8,7 @@
 #
 # Usage, as root on a fresh droplet:
 #
-#   export DUMP_DATE=20250801
+#   export DUMP_DATE=20260801
 #   export NEO4J_PASSWORD='choose-something'
 #   export APP_PASSWORD='choose-something-else'
 #   ./provision_droplet.sh
@@ -19,7 +19,7 @@
 #
 set -euo pipefail
 
-DUMP_DATE="${DUMP_DATE:?set DUMP_DATE, e.g. 20250801 (see https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html)}"
+DUMP_DATE="${DUMP_DATE:?set DUMP_DATE, e.g. 20260801 (see https://discogs-data-dumps.s3.us-west-2.amazonaws.com/index.html)}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:?set NEO4J_PASSWORD}"
 
 # Guards the viewer with HTTP basic auth. It defaults to the database password
@@ -88,9 +88,11 @@ preflight() {
     local avail_gb
     avail_gb=$(df -BG --output=avail "$DATA_DIR" | tail -1 | tr -dc '0-9')
     echo "  free space on $DATA_DIR: ${avail_gb} GB"
+    # Measured against the 2026-08 dump: 11.5 GB of .gz (releases alone is
+    # 10.4 GB), ~1 GB labels staging DB, ~4 GB CSVs, ~15 GB Neo4j store.
     if (( avail_gb < 45 )); then
-        echo "  WARNING: under 45 GB free. Peak need is ~35 GB (10 GB of .gz" >&2
-        echo "  dumps + ~5 GB CSVs + ~15 GB Neo4j store)." >&2
+        echo "  WARNING: under 45 GB free. Peak need is ~32 GB: 11.5 GB of .gz" >&2
+        echo "  dumps + ~1 GB labels.db + ~4 GB CSVs + ~15 GB Neo4j store." >&2
     fi
 
     # A little swap keeps the importer from being OOM-killed on 8 GB boxes.
@@ -204,15 +206,42 @@ download_dumps() {
         gzip -t "$f" || { echo "  $(basename "$f") is not valid gzip" >&2; exit 1; }
     done
 
-    if [[ -s "$checksums" ]]; then
-        log "Verifying checksums"
-        ( cd "$DATA_DIR" && grep -E "_(artists|labels|masters|releases)\.xml\.gz" "$checksums" \
-            | sha256sum -c - ) || {
-                echo "  checksum mismatch -- delete the offending file and re-run" >&2
-                exit 1
-            }
-    fi
+    verify_checksums "$checksums"
     du -sh "$DATA_DIR"
+}
+
+verify_checksums() {
+    local checksums="$1" kind f expected actual
+    if [[ ! -s "$checksums" ]]; then
+        echo "  no checksum file; skipping verification"
+        return 0
+    fi
+
+    log "Verifying checksums (a few minutes -- releases.xml.gz is ~10 GB)"
+    # Discogs publishes "<sha256> <filename>", one space. GNU `sha256sum -c`
+    # does accept that, but is all-or-nothing: one unparseable or absent line
+    # fails the batch, which after an 11 GB download is an expensive way to
+    # learn the format drifted. Comparing per file reports which one is wrong,
+    # skips entries it cannot read instead of aborting, and says what to delete.
+    for kind in artists labels masters releases; do
+        f="discogs_${DUMP_DATE}_${kind}.xml.gz"
+        expected=$(awk -v want="$f" 'index($0, want) { print $1; exit }' "$checksums")
+        if [[ ${#expected} -ne 64 ]]; then
+            echo "  no usable sha256 for $f in the checksum file; skipping it"
+            continue
+        fi
+        printf '  %-40s ' "$f"
+        actual=$(sha256sum "$DATA_DIR/$f" | awk '{print $1}')
+        if [[ "$actual" == "$expected" ]]; then
+            echo "ok"
+        else
+            echo "MISMATCH"
+            echo "    expected $expected" >&2
+            echo "    actual   $actual" >&2
+            echo "  delete $DATA_DIR/$f and re-run to fetch it again" >&2
+            return 1
+        fi
+    done
 }
 
 # ---------------------------------------------------------------- transform

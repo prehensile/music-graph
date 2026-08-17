@@ -48,21 +48,21 @@ There are two routes from dumps to CSVs. **Use the prefilter route** unless you 
 ```bash
 # 1. Transform. Reads the .gz dumps directly -- no decompression, no index.
 python discogs_to_neo4j.py \
-    --artist-xml  data/discogs_20250801_artists.xml.gz \
-    --label-xml   data/discogs_20250801_labels.xml.gz \
-    --master-xml  data/discogs_20250801_masters.xml.gz \
-    --release-xml data/discogs_20250801_releases.xml.gz \
+    --artist-xml  data/discogs_20260801_artists.xml.gz \
+    --label-xml   data/discogs_20260801_labels.xml.gz \
+    --master-xml  data/discogs_20260801_masters.xml.gz \
+    --release-xml data/discogs_20260801_releases.xml.gz \
     --label-sqlite data/labels.db \
-    --output-folder data/2025-08-01/
+    --output-folder data/2026-08-01/
 
 # 2. Flatten the deduplicated labels table, overwriting step 1's placeholder.
-python sqlite_to_csv.py --sqlite-path data/labels.db --output-folder data/2025-08-01/
+python sqlite_to_csv.py --sqlite-path data/labels.db --output-folder data/2026-08-01/
 
 # 3. Sanity-check node CSVs for duplicate IDs.
-python dupe_finder.py data/2025-08-01/artists.csv
+python dupe_finder.py data/2026-08-01/artists.csv
 
 # 4. Bulk import (Neo4j must be stopped).
-./neo4j_admin_import.sh data/2025-08-01 neo4j
+./neo4j_admin_import.sh data/2026-08-01 neo4j
 
 # 5. Create the full-text index the viewer searches through.
 cypher-shell -d neo4j "CREATE FULLTEXT INDEX entitySearch IF NOT EXISTS
@@ -81,7 +81,7 @@ Only worth it if you plan repeated experiments against *arbitrary* releases rath
 
 ```bash
 # 1. Split the releases dump into N chunks, each a well-formed XML document.
-python xml_split.py data/discogs_20250801_releases.xml release 16 releases
+python xml_split.py data/discogs_20260801_releases.xml release 16 releases
 # 2. Index each chunk into its own SQLite DB (parallelise these).
 python releases_to_sqlite.py --xml-file data/...releases.xml.1 --db-path data/releases_part1.db
 # 3. Merge the per-chunk DBs.
@@ -154,7 +154,7 @@ It ends by installing `music-graph.service`, a systemd unit running `server.py`,
 ### Terminal route
 
 ```bash
-export DUMP_DATE=20250801
+export DUMP_DATE=20260801
 export NEO4J_PASSWORD='choose-something'
 export APP_PASSWORD='choose-something-else'
 ./provision_droplet.sh
@@ -169,7 +169,19 @@ Everything goes to disk:
 
 Run interactively it tees to the terminal; unattended it redirects straight to the log file, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
 
-**Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Peak disk on the prefilter route is ~35 GB — 10 GB of `.gz` dumps, ~5 GB of CSVs, ~15 GB of Neo4j store — so no block-storage volume is needed. Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run that is destroyed afterward costs well under a pound. The index route would need a ~300 GB volume instead.
+**Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run destroyed afterwards costs well under a pound.
+
+Peak disk on the prefilter route, against the real 2026-08 dump sizes:
+
+| | |
+|---|---|
+| `.gz` dumps (releases alone is 10.4 GB) | 11.5 GB |
+| `labels.db` staging | ~1 GB |
+| generated CSVs | ~4 GB |
+| Neo4j store | ~15 GB |
+| **peak** | **~32 GB** |
+
+That fits the built-in 160 GB SSD with room to spare, so no block-storage volume is needed. The index route would instead need roughly 2× the *uncompressed* releases dump — about 220 GB — and therefore a paid volume.
 
 Going smaller than 8 GB is a false economy: `neo4j-admin import` gets tight on 4 GB and the saving over a single run is trivial next to a failed multi-hour job. The script adds a 4 GB swapfile on boxes under 16 GB as insurance.
 

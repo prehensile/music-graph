@@ -14,7 +14,7 @@
 #   /var/log/music-graph.status   one line, current stage
 #   /var/log/music-graph.log      full log
 
-export DUMP_DATE=20250801                    # check this date exists first
+export DUMP_DATE=20260801                    # check this date exists first
 export NEO4J_PASSWORD='change-me-please'     # database password
 export APP_PASSWORD='change-me-too'          # viewer login; sent over plain
                                              # HTTP, so use a throwaway
