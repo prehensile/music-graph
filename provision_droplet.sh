@@ -87,6 +87,9 @@ STEP_START=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+script_hash() { sha256sum "$SELF" 2>/dev/null | awk '{print $1}'; }
+
 # Checked before anything opens a file in /var/log, so a non-root run says why
 # rather than dying on a permission error.
 [[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
@@ -222,6 +225,9 @@ configure_firewall() {
 }
 
 fetch_repo() {
+    local self_before
+    self_before=$(script_hash)
+
     # A public repo needs no credentials. For a private one, set GITHUB_TOKEN to
     # a fine-grained token with read-only Contents access to just this repo.
     #
@@ -258,6 +264,16 @@ fetch_repo() {
             return 1
         fi
     fi
+    # bash reads a script incrementally by byte offset, so the pull above can
+    # rewrite this file mid-execution and corrupt the rest of the run. If the
+    # checkout changed it, restart from the top with the new version; every step
+    # is idempotent, so the restart costs only the checks it repeats.
+    if [[ "$self_before" != "$(script_hash)" && -z "${MUSIC_GRAPH_REEXEC:-}" ]]; then
+        echo "  provisioning script was updated by the pull; restarting with it"
+        export MUSIC_GRAPH_REEXEC=1
+        exec "$SELF"
+    fi
+
     pip3 install --quiet --break-system-packages -r "$REPO_DIR/requirements.txt"
 
     log "Vendoring browser libraries"
