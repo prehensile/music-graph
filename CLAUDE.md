@@ -172,6 +172,8 @@ export APP_PASSWORD='choose-something-else'
 ./provision_droplet.sh
 ```
 
+`START_AT=<n>` resumes from a given step (1-based, against the list in `STEP_NAMES`), for when the earlier work is already done — `START_AT=9` goes straight to the import. Preflight also skips the URL check for any dump already verified on disk, and treats 429/5xx as transient, so a rate limit cannot fail a run that needs no downloads.
+
 ### Watching it
 
 **The viewer serves a progress page at `/logs`.** The service is deliberately started *before* the slow steps, so the whole run can be watched from a browser: a step checklist with timings, a progress bar, and a live tail of the log, polled every 4 seconds. The graph endpoints stay broken until the import lands, and the page and the viewer both say so rather than failing silently.

@@ -28,6 +28,11 @@ NEO4J_PASSWORD="${NEO4J_PASSWORD:?set NEO4J_PASSWORD}"
 # in the clear.
 APP_PASSWORD="${APP_PASSWORD:-$NEO4J_PASSWORD}"
 APP_USER="${APP_USER:-music}"
+# Resume from a given step, 1-based, against the STEP_NAMES list below. Steps
+# are independent -- none passes state to a later one through shell variables --
+# so jumping in part-way is safe as long as the earlier work really is done.
+#   START_AT=9 ./provision_droplet.sh    # straight to the Neo4j import
+START_AT="${START_AT:-1}"
 APP_PORT="${APP_PORT:-80}"
 
 DUMP_YEAR="${DUMP_DATE:0:4}"
@@ -138,6 +143,12 @@ step() {
     STEP_NUM=$(( STEP_NUM + 1 ))
     STEP_NAME="${STEP_NAMES[$(( STEP_NUM - 1 ))]}"
     STEP_START=$SECONDS
+    if (( STEP_NUM < START_AT )); then
+        emit_step "skipped"
+        printf '\n[%s] -- [%d/%d] %s (skipped, START_AT=%d)\n' \
+            "$(date -u +%H:%M:%S)" "$STEP_NUM" "$TOTAL_STEPS" "$STEP_NAME" "$START_AT"
+        return
+    fi
     emit_step "running"
     log "[${STEP_NUM}/${TOTAL_STEPS}] ${STEP_NAME}"
     "$fn"
@@ -308,16 +319,35 @@ check_dump_urls() {
         return 0
     fi
 
+    # Only check what we still need to fetch. Checking a URL for a dump already
+    # on disk and checksum-verified is pointless traffic, and Discogs rate-limits
+    # it -- a 429 here used to fail the whole run despite nothing being needed.
+    local name url code bad=0 wanted=()
+    for name in artists labels masters releases; do
+        [[ -f "$DATA_DIR/discogs_${DUMP_DATE}_${name}.xml.gz.ok" ]] || wanted+=("$name")
+    done
+    if (( ${#wanted[@]} == 0 )); then
+        echo "  all four dumps already verified on disk; no URL check needed"
+        return 0
+    fi
+
     # HEAD, not a ranged GET. A server that ignores Range answers a range
     # request with the whole body, which here would mean downloading 10 GB
     # during what is supposed to be a two-second check. HEAD carries no body.
-    local name url code bad=0
-    echo "  checking dump URLs under ${DUMP_HOST}?download=${DUMP_PREFIX}/"
-    for name in artists labels masters releases; do
+    echo "  checking ${#wanted[@]} dump URL(s) under ${DUMP_HOST}?download=${DUMP_PREFIX}/"
+    for name in "${wanted[@]}"; do
         url=$(dump_url "discogs_${DUMP_DATE}_${name}.xml.gz")
         code=$(curl -sS --head -o /dev/null -w '%{http_code}' --max-time 30 "$url" 2>/dev/null || echo 000)
         printf '    %-9s HTTP %s\n' "$name" "$code"
-        [[ "$code" == 200 ]] || bad=1
+        case "$code" in
+            200) ;;
+            # Rate limiting or a server wobble says nothing about whether the
+            # path is right, and the download step retries properly. Warn and
+            # carry on rather than failing a preflight check.
+            429|5??|000)
+                echo "      transient ($code); not treating this as a bad path" >&2 ;;
+            *) bad=1 ;;
+        esac
     done
 
     if (( bad )); then

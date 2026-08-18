@@ -33,6 +33,8 @@
   .s-running .mark { color: var(--accent); }
   .s-failed  .mark { color: #f87171; }
   .s-pending { color: var(--muted); }
+  .s-skipped { color: var(--muted); }
+  .s-skipped .mark { color: var(--muted); }
   .s-running { color: var(--text); font-weight: 600; }
   .s-failed  { color: #fca5a5; }
   .elapsed { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -75,7 +77,7 @@
 <script>
 'use strict';
 const $ = (id) => document.getElementById(id);
-const MARKS = { done: '✓', running: '●', failed: '✗', pending: '○' };
+const MARKS = { done: '✓', running: '●', failed: '✗', skipped: '–', pending: '○' };
 
 function fmt(seconds) {
   if (!seconds || seconds < 1) return '';

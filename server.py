@@ -124,7 +124,9 @@ def read_progress():
         pass
 
     total = steps[0].get("of") if steps else 0
-    done = sum(1 for s in steps if s.get("state") == "done")
+    # A skipped step (START_AT) is not outstanding work, so count it as settled
+    # or the page would sit at "in progress" forever after a partial re-run.
+    done = sum(1 for s in steps if s.get("state") in ("done", "skipped"))
     failed = any(s.get("state") == "failed" for s in steps)
     running = next((s for s in steps if s.get("state") == "running"), None)
 
