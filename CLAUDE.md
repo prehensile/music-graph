@@ -30,6 +30,7 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 ├── merge_sqlite_releases.py  # merge per-chunk SQLite parts into one DB
 ├── optimise_sqlite_db.py     # ANALYZE the merged DB
 │
+├── notes/                    # session handovers; read the newest first
 └── web/                      # the viewer, served by server.py
     ├── index.html
     ├── app.js                # Viewer: sigma + force layout + API calls
