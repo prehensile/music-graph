@@ -295,81 +295,141 @@ check_dump_urls() {
     fi
 }
 
+# Expected sha256 for one dump file, empty if the checksum file has no line
+# for it. Discogs publishes "<sha256> <filename>", one space.
+expected_sha() {
+    local fname="$1" checksums="$2" hash
+    [[ -s "$checksums" ]] || return 0
+    hash=$(awk -v want="$fname" 'index($0, want) { print $1; exit }' "$checksums")
+    [[ ${#hash} -eq 64 ]] && printf '%s' "$hash"
+}
+
+sha_matches() {
+    local f="$1" want="$2"
+    [[ -n "$want" && -s "$f" ]] || return 1
+    [[ "$(sha256sum "$f" | awk '{print $1}')" == "$want" ]]
+}
+
+# Cheap discriminator between a genuine partial download and a saved error
+# page. Checking the gzip magic costs two bytes; `gzip -t` on the releases dump
+# would decompress ~110 GB to tell us the same thing.
+looks_like_gzip() {
+    [[ -s "$1" ]] || return 1
+    [[ "$(head -c 2 "$1" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]
+}
+
+# True if the file matches its published checksum, or -- when no checksum is
+# available -- at least decompresses cleanly. The gzip fallback is slow on the
+# releases dump (it inflates ~110 GB) but only runs if Discogs stopped
+# publishing CHECKSUM.txt.
+dump_is_good() {
+    local f="$1" want="$2"
+    if [[ -n "$want" ]]; then
+        sha_matches "$f" "$want"
+    else
+        gzip -t "$f" 2>/dev/null
+    fi
+}
+
+# Fetch one dump, resuming across interruptions, and verify it before returning.
+#
+# Verification lives in this loop rather than in the caller because curl reports
+# *success* when a resume request is answered 416: it takes that to mean the
+# local file is already complete. A truncated partial then looks like a clean
+# download, and only the checksum can tell the difference.
+fetch_dump() {
+    local url="$1" f="$2" want="${3:-}" attempt rc
+    for attempt in 1 2 3 4 5 6; do
+        # Never resume onto something that is not gzip: an error page saved
+        # under the dump's name would otherwise be extended forever.
+        if [[ -s "$f" ]] && ! looks_like_gzip "$f"; then
+            echo "    discarding non-gzip partial"
+            rm -f "$f"
+        fi
+        if [[ -s "$f" ]]; then
+            echo "    attempt ${attempt}, resuming from $(du -h "$f" | cut -f1)"
+        else
+            echo "    attempt ${attempt}"
+        fi
+
+        # --http1.1     Cloudflare resets HTTP/2 streams on long transfers,
+        #               which shows up as curl 92 INTERNAL_ERROR part-way
+        #               through the 10 GB releases dump.
+        # --retry-all-errors  curl does not retry protocol errors like 92 on
+        #               its own, so plain --retry never fired for that failure.
+        # --speed-limit/-time  abandon a connection that has stalled at under
+        #               4 KB/s for a minute instead of sitting at 0 B/s.
+        # rc is captured with || rather than after an if: `rc=$?` following an
+        # if-block reads the status of the if construct, which is 0 whenever no
+        # branch ran, so the checks below would never fire.
+        rc=0
+        curl -fL --http1.1 \
+                --retry 3 --retry-delay 5 --retry-all-errors \
+                --speed-limit 4096 --speed-time 60 \
+                -C - "$url" -o "$f" || rc=$?
+
+        if (( rc == 0 )); then
+            if dump_is_good "$f" "$want"; then
+                return 0
+            fi
+            echo "    download verified bad (truncated or corrupt); starting over" >&2
+            rm -f "$f"
+        elif (( rc == 33 || rc == 36 )); then
+            echo "    server refused the resume (curl ${rc}); starting over" >&2
+            rm -f "$f"
+        else
+            echo "    interrupted (curl ${rc}); will resume" >&2
+        fi
+        sleep $(( attempt * 15 ))
+    done
+    return 1
+}
+
 download_dumps() {
     local checksums="$DATA_DIR/discogs_${DUMP_DATE}_CHECKSUM.txt"
 
     if [[ ! -s "$checksums" ]]; then
-        curl -fsSL --retry 5 --retry-delay 5 \
+        curl -fsSL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
             "$(dump_url "discogs_${DUMP_DATE}_CHECKSUM.txt")" -o "$checksums" \
-            || echo "  no CHECKSUM file retrieved; downloads will not be verified"
+            || echo "  no CHECKSUM file retrieved; downloads cannot be verified"
     fi
 
-    local name f url
+    local name fname f want
     for name in artists labels masters releases; do
-        f="$DATA_DIR/discogs_${DUMP_DATE}_${name}.xml.gz"
-        url=$(dump_url "discogs_${DUMP_DATE}_${name}.xml.gz")
+        fname="discogs_${DUMP_DATE}_${name}.xml.gz"
+        f="$DATA_DIR/$fname"
+        want=$(expected_sha "$fname" "$checksums")
 
-        if [[ -s "$f" ]] && gzip -t "$f" 2>/dev/null; then
-            echo "  have $(basename "$f") ($(du -h "$f" | cut -f1)), skipping"
+        if [[ -f "$f.ok" ]]; then
+            echo "  $fname verified previously, skipping"
             continue
         fi
 
-        echo "  fetching $(basename "$f")"
-        # -C - resumes an interrupted download. Verified safe: against a
-        # server that ignores Range, curl exits 33 ("Cannot resume") and leaves
-        # the partial file alone rather than appending a second copy. The
-        # failure path below then deletes it so a re-run starts clean.
-        curl -fL --retry 5 --retry-delay 10 -C - "$url" -o "$f" || {
-            echo "  FAILED: $url" >&2
-            echo "  Confirm the date exists at ${DUMP_INDEX_URL}" >&2
-            rm -f "$f"
+        # A complete file left by a run that died before verifying costs one
+        # checksum to recognise, which beats fetching 10 GB again.
+        if sha_matches "$f" "$want"; then
+            echo "  $fname already complete"
+            touch "$f.ok"
+            continue
+        fi
+
+        echo "  fetching $fname"
+        fetch_dump "$(dump_url "$fname")" "$f" "$want" || {
+            echo "  giving up on $fname after 6 attempts" >&2
+            if looks_like_gzip "$f"; then
+                echo "  keeping the $(du -h "$f" | cut -f1) partial -- re-running resumes it" >&2
+            else
+                rm -f "$f"
+            fi
             exit 1
         }
-        # A truncated or HTML-error-page download fails this. Delete it so a
-        # re-run fetches cleanly instead of trying to resume rubbish.
-        gzip -t "$f" || {
-            echo "  $(basename "$f") is not valid gzip -- discarding it" >&2
-            rm -f "$f"
-            exit 1
-        }
+
+        # fetch_dump only returns 0 once the file has passed verification.
+        echo "  $fname verified"
+        touch "$f.ok"
     done
 
-    verify_checksums "$checksums"
     du -sh "$DATA_DIR"
-}
-
-verify_checksums() {
-    local checksums="$1" kind f expected actual
-    if [[ ! -s "$checksums" ]]; then
-        echo "  no checksum file; skipping verification"
-        return 0
-    fi
-
-    log "Verifying checksums (a few minutes -- releases.xml.gz is ~10 GB)"
-    # Discogs publishes "<sha256> <filename>", one space. GNU `sha256sum -c`
-    # does accept that, but is all-or-nothing: one unparseable or absent line
-    # fails the batch, which after an 11 GB download is an expensive way to
-    # learn the format drifted. Comparing per file reports which one is wrong,
-    # skips entries it cannot read instead of aborting, and says what to delete.
-    for kind in artists labels masters releases; do
-        f="discogs_${DUMP_DATE}_${kind}.xml.gz"
-        expected=$(awk -v want="$f" 'index($0, want) { print $1; exit }' "$checksums")
-        if [[ ${#expected} -ne 64 ]]; then
-            echo "  no usable sha256 for $f in the checksum file; skipping it"
-            continue
-        fi
-        printf '  %-40s ' "$f"
-        actual=$(sha256sum "$DATA_DIR/$f" | awk '{print $1}')
-        if [[ "$actual" == "$expected" ]]; then
-            echo "ok"
-        else
-            echo "MISMATCH"
-            echo "    expected $expected" >&2
-            echo "    actual   $actual" >&2
-            echo "  delete $DATA_DIR/$f and re-run to fetch it again" >&2
-            return 1
-        fi
-    done
 }
 
 # ---------------------------------------------------------------- transform
