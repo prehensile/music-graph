@@ -333,13 +333,18 @@ dump_is_good() {
 
 # Fetch one dump, resuming across interruptions, and verify it before returning.
 #
-# Verification lives in this loop rather than in the caller because curl reports
-# *success* when a resume request is answered 416: it takes that to mean the
-# local file is already complete. A truncated partial then looks like a clean
-# download, and only the checksum can tell the difference.
+# wget rather than curl, for a measured reason: curl's own --retry restarts the
+# transfer from byte 0 -- every retry goes out with no Range header -- so an
+# interrupted 10 GB download is re-fetched from scratch, repeatedly, before any
+# outer loop regains control. wget's --tries resumes instead, reissuing with the
+# correct Range each time. wget 1.x also speaks only HTTP/1.1, so the Cloudflare
+# HTTP/2 stream reset (curl 92) that broke the first run cannot recur.
+#
+# Verification stays in this loop because neither tool checks content: a
+# truncated file can otherwise be reported as a clean download.
 fetch_dump() {
     local url="$1" f="$2" want="${3:-}" attempt rc
-    for attempt in 1 2 3 4 5 6; do
+    for attempt in 1 2 3; do
         # Never resume onto something that is not gzip: an error page saved
         # under the dump's name would otherwise be extended forever.
         if [[ -s "$f" ]] && ! looks_like_gzip "$f"; then
@@ -352,21 +357,15 @@ fetch_dump() {
             echo "    attempt ${attempt}"
         fi
 
-        # --http1.1     Cloudflare resets HTTP/2 streams on long transfers,
-        #               which shows up as curl 92 INTERNAL_ERROR part-way
-        #               through the 10 GB releases dump.
-        # --retry-all-errors  curl does not retry protocol errors like 92 on
-        #               its own, so plain --retry never fired for that failure.
-        # --speed-limit/-time  abandon a connection that has stalled at under
-        #               4 KB/s for a minute instead of sitting at 0 B/s.
-        # rc is captured with || rather than after an if: `rc=$?` following an
-        # if-block reads the status of the if construct, which is 0 whenever no
-        # branch ran, so the checks below would never fire.
+        # --read-timeout abandons a connection stalled mid-body, which is how
+        # the Cloudflare failure presented (minutes at 0 B/s before erroring).
+        # dot:giga keeps progress to roughly one line per 32 MiB, which is
+        # readable in the log rather than thousands of lines.
         rc=0
-        curl -fL --http1.1 \
-                --retry 3 --retry-delay 5 --retry-all-errors \
-                --speed-limit 4096 --speed-time 60 \
-                -C - "$url" -o "$f" || rc=$?
+        wget --continue --tries=10 --waitretry=10 --retry-connrefused \
+             --timeout=30 --read-timeout=60 \
+             --progress=dot:giga \
+             -O "$f" "$url" || rc=$?
 
         if (( rc == 0 )); then
             if dump_is_good "$f" "$want"; then
@@ -374,13 +373,10 @@ fetch_dump() {
             fi
             echo "    download verified bad (truncated or corrupt); starting over" >&2
             rm -f "$f"
-        elif (( rc == 33 || rc == 36 )); then
-            echo "    server refused the resume (curl ${rc}); starting over" >&2
-            rm -f "$f"
         else
-            echo "    interrupted (curl ${rc}); will resume" >&2
+            echo "    wget gave up (exit ${rc}); retrying" >&2
         fi
-        sleep $(( attempt * 15 ))
+        sleep $(( attempt * 20 ))
     done
     return 1
 }
@@ -389,8 +385,8 @@ download_dumps() {
     local checksums="$DATA_DIR/discogs_${DUMP_DATE}_CHECKSUM.txt"
 
     if [[ ! -s "$checksums" ]]; then
-        curl -fsSL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
-            "$(dump_url "discogs_${DUMP_DATE}_CHECKSUM.txt")" -o "$checksums" \
+        wget -q --tries=5 --timeout=30 \
+            -O "$checksums" "$(dump_url "discogs_${DUMP_DATE}_CHECKSUM.txt")" \
             || echo "  no CHECKSUM file retrieved; downloads cannot be verified"
     fi
 
