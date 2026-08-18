@@ -63,6 +63,7 @@ dump_url() {
 LOG_FILE="${LOG_FILE:-/var/log/music-graph.log}"
 STATUS_FILE="${STATUS_FILE:-/var/log/music-graph.status}"
 STEPS_FILE="${STEPS_FILE:-/var/log/music-graph.steps.jsonl}"
+REPORT_TXT="${REPORT_TXT:-/var/log/music-graph.report.txt}"
 ENV_FILE=/etc/music-graph.env
 UNIT_FILE=/etc/systemd/system/music-graph.service
 
@@ -599,6 +600,17 @@ verify() {
         "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS nodes ORDER BY nodes DESC;"
     cypher-shell -d "$DATABASE" \
         "MATCH ()-[r]->() RETURN type(r) AS rel, count(*) AS count ORDER BY count DESC;"
+
+    # A fuller report, saved next to the logs so a later run can be compared
+    # against this one. Deliberately tolerant: by this point the expensive work
+    # is done and a stats failure must not fail the provision.
+    log "Writing the build report"
+    DATA_DIR="$DATA_DIR" STEPS_FILE="$STEPS_FILE" \
+    NEO4J_URI=bolt://localhost:7687 NEO4J_USERNAME=neo4j \
+    NEO4J_PASSWORD="$NEO4J_PASSWORD" NEO4J_DATABASE="$DATABASE" \
+        python3 "$REPO_DIR/graph_stats.py" -o "$REPORT_TXT" \
+        || echo "  stats failed; run graph_stats.py by hand" >&2
+    chmod 644 "$REPORT_TXT" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- main
@@ -659,6 +671,7 @@ throwaway and do not reuse it.
 
 Logs:   ${LOG_FILE}
 Status: ${STATUS_FILE}
+Report: ${REPORT_TXT}   (regenerate any time with graph_stats.py)
 
 When you are finished, snapshot or destroy the droplet -- it bills by the hour.
 EOF

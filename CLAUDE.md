@@ -15,6 +15,7 @@ The engineering problem is scale: the releases dump is tens of GB of XML in one 
 ├── discogs_to_neo4j.py       # the transform: XML dumps -> Neo4j import CSVs
 ├── sqlite_to_csv.py          # labels staging table -> labels.csv
 ├── dupe_finder.py            # pre-import check for duplicate node IDs
+├── graph_stats.py            # what the build produced, and what it cost
 ├── progress.py               # periodic plain-text progress lines
 ├── neo4j_admin_import.sh     # the bulk import itself
 ├── server.py                 # HTTP front end: static viewer + JSON API
@@ -179,10 +180,25 @@ Everything is on disk too:
 | `/var/log/music-graph.status` | one line — current stage, or the failing line number and exit code |
 | `/var/log/music-graph.steps.jsonl` | one JSON object per step transition (`pending`/`running`/`done`/`failed`) |
 | `/var/log/music-graph.log` | the full log |
+| `/var/log/music-graph.report.txt` | the build report, written at the end by `graph_stats.py` |
 
 The steps file is append-only, one record per transition, with later records superseding earlier ones for the same step number. A flat file needs no coordination between the shell script and the web server, and survives either being restarted. `main()` seeds a `pending` record for every step up front so the page shows the full checklist by name from the start rather than growing as the run proceeds.
 
 Run interactively the script tees to the terminal; unattended it redirects straight to the log file, deliberately avoiding `tee` via process substitution, which can drop buffered output when the shell exits and truncate the failure trace.
+
+### Build statistics
+
+`graph_stats.py` reports what a build produced and what it cost: node and relationship counts, derived ratios (credited artists per release, members per group), per-step timings pulled from `music-graph.steps.jsonl`, and the sizes of the dumps, CSVs and Neo4j store. Provisioning runs it at the end and saves the output; run it again any time.
+
+```bash
+python graph_stats.py            # fast summary, about a second
+python graph_stats.py --deep     # plus hubs, unconnected nodes, releases by decade
+python graph_stats.py --json -o stats.json
+```
+
+The default report is cheap because every count comes from Neo4j's count store — `MATCH (n:Artist) RETURN count(n)` is O(1), not a scan of 10M nodes. `--deep` is where the scans live: degree ordering, `WHERE NOT (n)--()`, and grouping releases by decade all walk their label. Each deep query is timed and individually fault-tolerant, so a slow or failing one costs only its own section rather than the whole report — worth having on a box where an overloaded Neo4j may time a query out.
+
+The call from `provision_droplet.sh` is deliberately tolerant (`|| echo ...`): by the time it runs, hours of downloading and transforming are already banked, and a stats failure must not fail the provision.
 
 ### Progress reporting in the Python scripts
 
