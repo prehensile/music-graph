@@ -128,19 +128,21 @@ Per entity in the default route: **Artists/Groups** XML → CSV directly; **Rele
 
 | Node | Source | Key properties |
 |---|---|---|
-| `Artist` | `<artist>` with no `<members>` | `artistId:ID(Artist)`, `name`, `realname`, `profile` |
-| `Group` | `<artist>` **with** `<members>` | `groupId:ID(Group)`, `name`, `profile` |
+| `Artist` | `<artist>` with no `<members>` | `artistId:ID(Entity)`, `name`, `realname`, `profile` |
+| `Group` | `<artist>` **with** `<members>` | `groupId:ID(Entity)`, `name`, `profile` |
 | `Release` | `<release>` named by a master's `main_release` | `releaseId:ID(Release)`, `year`, `title` |
 | `Label` | `<label>`, plus inline refs inside releases | `labelId:ID(Label)`, `name`, `profile` |
 
 | Relationship | CSV | Direction |
 |---|---|---|
-| `MEMBER_OF` | `artist_group_links.csv` | Artist → Group |
-| `CREDITED` | `artist_release_links.csv` | Artist → Release (`<artists>` and `<extraartists>`) |
+| `MEMBER_OF` | `artist_group_links.csv` | Artist → Group (both `Entity`) |
+| `CREDITED` | `artist_release_links.csv` | Artist **or Group** → Release (`<artists>` and `<extraartists>`) |
 | `RELEASED_ON` | `release_label_links.csv` | Release → Label |
 | `SUBLABEL` | `label_sublabel_links.csv` | sublabel Label → parent Label |
 
-`Artist` and `Group` are separate Neo4j ID spaces drawn from the same Discogs ID sequence — a given ID lands in exactly one of `artists.csv` or `groups.csv` depending on whether it has `<members>`. Relationship rows must point into the right space; getting it backwards produces dangling edges the importer rejects rather than a silently wrong graph.
+`Artist` and `Group` are separate Neo4j **labels** but share one import **ID space**, `Entity`. They have to. Discogs issues artist and group IDs from a single sequence, and a release credits a band with exactly the same kind of ID it uses for a person — `process_release` cannot tell which it has. With separate spaces, every release credited to a band emitted a dangling `CREDITED` row, because the band's ID lives in `groups.csv` while the edge declared `:START_ID(Artist)`. A shared space stays unique because each Discogs ID lands in exactly one of the two files.
+
+That makes the ID space the thing to get right, and the importer is the check on it: dangling edges are rejected rather than producing a silently wrong graph.
 
 **Masters are an intermediate hop, not a node.** There is no `Master` label in the graph.
 
@@ -296,7 +298,7 @@ The arc: naive parse → generalise → ripgrep → binary search → SQLite ind
 
 - **`open_writer` appends.** CSVs open in `"a"` mode with the header re-written per call, so re-running into a folder holding output duplicates every row and injects headers mid-file. `discogs_to_neo4j.py` **refuses to start** if the output folder contains any `.csv`. The append mode itself is unchanged — switching to `"w"` would clobber output on partial re-runs, so the guard is deliberately a refusal.
 - **`labels.csv` is written twice.** The transform creates a header-only placeholder whenever `--label-xml` is given; `sqlite_to_csv.py` overwrites it with the real export. Skipping that second step leaves an empty label set and dangling `RELEASED_ON` edges.
-- **Sublabels can dangle.** Sublabels go into `label_sublabel_links.csv` but not `labels.csv`, assuming every sublabel also appears as a top-level `<label>`. `neo4j_admin_import.sh` therefore runs with `--skip-bad-relationships=true` and `--bad-tolerance=250000` — well below the smallest relationship file (~300k rows) — so a handful of dangling sublabels pass while a systemic fault, such as edges written into the wrong ID space, still aborts the import. Anything skipped is listed in `import.report` and summarised at the end of the step.
+- **Sublabels are registered as `Label` nodes.** They used to go into `label_sublabel_links.csv` only, on the theory that every sublabel also appears as a top-level `<label>`; where that does not hold the `SUBLABEL` edge dangles. `process_label` now upserts the sublabel too, which is safe because a later top-level record supersedes the name-only one. `neo4j_admin_import.sh` therefore runs with `--skip-bad-relationships=true` and `--bad-tolerance=250000` — well below the smallest relationship file (~300k rows) — so a handful of dangling sublabels pass while a systemic fault, such as edges written into the wrong ID space, still aborts the import. Anything skipped is listed in `import.report` and summarised at the end of the step.
 - **`fetch_repo` can rewrite the running script.** `git reset --hard` replaces `provision_droplet.sh` while bash is part-way through executing it, and bash reads a script incrementally by byte offset, so the remainder of the run can be garbage. The step hashes itself before and after the checkout and re-execs once (guarded by `MUSIC_GRAPH_REEXEC`) if it changed. Re-running is cheap because every step is idempotent.
 - **`neo4j-admin` writes `import.report` relative to the current directory.** Provisioning runs from `/` (cloud-init's cwd, which `sudo -u` does not change), so the unprivileged `neo4j` user cannot create it and the import dies with `AccessDeniedException: /import.report` *after* the transform has already run. The path is now passed explicitly with `--report-file`.
 - **The full-text index must exist** before search works. `provision_droplet.sh` creates it and waits via `db.awaitIndexes`; building it over ~15M nodes takes a while. Without it, `/api/search` returns a "query failed" error.

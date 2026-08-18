@@ -33,12 +33,12 @@ done
 REPORT_FILE="${REPORT_FILE:-$CSV_DIR/import.report}"
 cd "$CSV_DIR"
 
-# --skip-bad-relationships with a bounded tolerance: a sublabel that never
-# appears as a top-level <label> yields a dangling SUBLABEL row, which is
-# expected and harmless. The tolerance is deliberately far below the size of any
-# single relationship file (the smallest is ~300k rows, the largest ~14M), so a
-# systemic fault -- edges written into the wrong ID space, say -- still aborts
-# the import rather than being silently skipped.
+# Artists and groups share one ID space, and sublabels are registered as Label
+# nodes, so essentially every edge should resolve. The tolerance is for genuine
+# dump drift -- a release crediting an artist id that is absent from the artists
+# dump, say -- and is set low on purpose: an earlier run aborted here with
+# 250,004 bad rows, which was the importer correctly refusing a real modelling
+# bug rather than a threshold that needed raising.
 neo4j-admin database import full "$DATABASE" \
     --nodes=Artist="$CSV_DIR/artists.csv" \
     --nodes=Group="$CSV_DIR/groups.csv" \
@@ -50,7 +50,7 @@ neo4j-admin database import full "$DATABASE" \
     --relationships=RELEASED_ON="$CSV_DIR/release_label_links.csv" \
     --multiline-fields=true \
     --skip-bad-relationships=true \
-    --bad-tolerance=250000 \
+    --bad-tolerance=50000 \
     --report-file="$REPORT_FILE" \
     --overwrite-destination
 

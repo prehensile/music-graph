@@ -32,20 +32,28 @@ def init_csv_writers( out_dir, xml_files, write_releases=False ):
     writers = {}
     
     if xml_files["artist"] is not None:
-        
+
+        # Artist and Group are separate Neo4j labels but share one import ID
+        # space, "Entity". They have to: Discogs issues artist and group IDs
+        # from a single sequence, and a release credits a band by exactly the
+        # same kind of ID it uses for a person. With separate spaces every
+        # release credited to a band produced a dangling CREDITED row, because
+        # the band's ID lives in groups.csv while the edge declared
+        # :START_ID(Artist). A shared space stays unique because each Discogs
+        # ID lands in exactly one of the two files.
         writers["artists"] = open_writer(
             f"{out_dir}/artists.csv",
-            ["artistId:ID(Artist)", "name", "realname", "profile"]
+            ["artistId:ID(Entity)", "name", "realname", "profile"]
         )
 
         writers["groups"] = open_writer(
             f"{out_dir}/groups.csv",
-            ["groupId:ID(Group)", "name", "profile"]
+            ["groupId:ID(Entity)", "name", "profile"]
         )
 
         writers["artist_group_links"] = open_writer(
             f"{out_dir}/artist_group_links.csv",
-            [":START_ID(Artist)", ":END_ID(Group)"]
+            [":START_ID(Entity)", ":END_ID(Entity)"]
         )
 
 
@@ -59,9 +67,10 @@ def init_csv_writers( out_dir, xml_files, write_releases=False ):
             ["releaseId:ID(Release)", "year", "title"]
         )
 
+        # Entity, not Artist: the credited party may be a band. See above.
         writers["artist_release_links"] = open_writer(
             f"{out_dir}/artist_release_links.csv",
-            [":START_ID(Artist)", ":END_ID(Release)"]
+            [":START_ID(Entity)", ":END_ID(Release)"]
         )
 
         writers["release_label_links"] = open_writer(
@@ -112,68 +121,73 @@ def safe_text( element, tag_name ):
     return element.find(tag_name).text if element.find(tag_name) is not None else ""
 
 
+def upsert_label( sqlite_files, writers, label_id, name, profile="" ):
+    """
+    Record a Label. The upsert keeps whichever sighting is richer, which is why
+    labels stage through SQLite rather than being written straight to CSV.
+    """
+    if not label_id:
+        return
+    if sqlite_files["label"]:
+        sqlite_files["label"].execute(
+            "INSERT INTO labels (id, name, profile) VALUES (?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+            "profile=COALESCE(NULLIF(excluded.profile,''), profile)",
+            ( label_id, name or "", profile )
+        )
+    else:
+        writers["labels"].writerow([ label_id, name or "", profile ])
+
+
 def process_label( element: Element, writers, xml_files, sqlite_files ):
 
     p = element.getparent()
 
-    if p.tag == "sublabels":
+    if p is not None and p.tag == "sublabels":
+        # <label><id>1</id>...<sublabels><label id="2">Name</label></sublabels>
+        # The dump contains malformed entries -- a bare <label/> with no id --
+        # so read defensively rather than raising past the caller.
+        element_id = element.attrib.get("id")
+        parent_id = p.getparent().find("id") if p.getparent() is not None else None
+        if element_id is None or parent_id is None:
+            return
 
-        # actually a sublabel
-        element_id = element.attrib["id"]
-        element_name = element.text
+        writers["label_sublabel_links"].writerow([ element_id, parent_id.text ])
 
-        label_id = p.getparent().find("id").text
+        # Register the sublabel as a Label in its own right. Leaving this out
+        # was the original behaviour, on the theory that every sublabel also
+        # appears as a top-level <label>; where that does not hold the SUBLABEL
+        # edge dangles and the import rejects it. Going through the upsert makes
+        # it safe either way -- a later top-level record supersedes this
+        # name-only one, and re-seeing the same id is a no-op.
+        upsert_label( sqlite_files, writers, element_id, element.text )
+        return
 
-        writers["label_sublabel_links"].writerow([
-            element_id,
-            label_id
-        ])
-        
-        # current theory: sublabels are already included in labels, this is introducing duplicates
-        # writers["labels"].writerow([
-        #     element_id,
-        #     element_name,
-        #     ""
-        # ])
-    
-    else:
+    if element.xpath('ancestor::release'):
+        # A label referenced inside a release listing, which carries only
+        # id and name as attributes.
+        upsert_label( sqlite_files, writers,
+                      element.attrib.get("id"), element.attrib.get("name") )
+        return
 
-        element_id = None
-        element_name = None
-        element_profile = ""
+    # A top-level <label>. Some have no <name>; take what is there rather than
+    # dropping the record, since its id is still referenced by other rows.
+    element_id = element.find("id")
+    if element_id is None:
+        return
+    upsert_label( sqlite_files, writers, element_id.text,
+                  safe_text( element, "name" ), safe_text( element, "profile" ) )
 
-        res = element.xpath('ancestor::release')
-        if len(res) > 0:
-            # node has an ancestor named release, so we're a label node in a release listing
-            element_id = element.attrib["id"]
-            element_name = element.attrib["name"]
-        else:
-            # no grandparent named release, probably a regular label node
-            element_id = element.find("id").text
-            element_name = element.find("name").text
-            element_profile = safe_text( element, "profile" )
-
-        if sqlite_files["label"]:
-            cursor = sqlite_files["label"]
-            cursor.execute(
-                "INSERT INTO labels (id, name, profile) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, profile=COALESCE(NULLIF(excluded.profile,''), profile)",
-                ( element_id, element_name, element_profile)
-            )
-
-        else:
-
-            writers["labels"].writerow([
-                element_id,
-                element_name,
-                element_profile
-            ])
 
 def process_artist(element: Element, writers):
 
     try:
 
+        # A handful of artists have no <name>. Keep the record anyway: its id is
+        # referenced by MEMBER_OF and CREDITED rows, and dropping the node makes
+        # every one of those dangle.
         element_id = element.find("id").text
-        element_name = element.find("name").text
+        element_name = safe_text( element, "name" )
         element_profile = safe_text( element, "profile" )
 
         members = element.find("members")
