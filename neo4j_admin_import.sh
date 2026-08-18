@@ -33,12 +33,17 @@ done
 REPORT_FILE="${REPORT_FILE:-$CSV_DIR/import.report}"
 cd "$CSV_DIR"
 
-# Artists and groups share one ID space, and sublabels are registered as Label
-# nodes, so essentially every edge should resolve. The tolerance is for genuine
-# dump drift -- a release crediting an artist id that is absent from the artists
-# dump, say -- and is set low on purpose: an earlier run aborted here with
-# 250,004 bad rows, which was the importer correctly refusing a real modelling
-# bug rather than a threshold that needed raising.
+# Artists and groups share one ID space, sublabels are registered as Label
+# nodes, and the "Various"/"Unknown Artist" placeholder ids (194, 355 -- see
+# PLACEHOLDER_ARTIST_IDS in discogs_to_neo4j.py) are filtered out of CREDITED
+# before they are ever written, since neither has a real artist page to link
+# to. What is left is genuine dump drift: releases and groups referencing a
+# handful of other artist ids with no page of their own. Measured on the
+# 2026-08 dump that is on the order of ten thousand rows, well under the
+# tolerance here -- which is still set low on purpose. An earlier run aborted
+# at 250,004 bad rows before the ID-space fix, and that was the importer
+# correctly refusing a real modelling bug rather than a threshold that needed
+# raising; keep it low enough that a similar systemic fault still aborts.
 neo4j-admin database import full "$DATABASE" \
     --nodes=Artist="$CSV_DIR/artists.csv" \
     --nodes=Group="$CSV_DIR/groups.csv" \

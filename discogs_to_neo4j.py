@@ -15,6 +15,16 @@ from lxml.etree import Element
 import lxml.etree as et
 
 
+# Discogs sentinel artist ids: placeholders with no artist page of their own,
+# credited on releases instead of a real performer. 194 is "Various" (a
+# compilation credited as a whole), 355 is "Unknown Artist". Neither exists in
+# the artists dump -- confirmed absent, not merely dropped by a parsing bug --
+# so every CREDITED row naming them would otherwise dangle. Writing a generic
+# node for them instead would be worse than dropping the edge: it would link
+# together thousands of releases that share nothing but an unknown performer.
+PLACEHOLDER_ARTIST_IDS = {"194", "355"}
+
+
 def open_writer( fn, header, write_header=True ):
     writer = csv.writer( open(fn,"a"), quoting=csv.QUOTE_STRINGS )
     if write_header and (header is not None):
@@ -238,9 +248,9 @@ def process_release( element: Element, writers, xml_files, sqlite_files ):
         extra_artists = element.find("extraartists")
         for source in [ artists, extra_artists ]:
             if source is not None:
-                for artist in source.findall("artist"): 
+                for artist in source.findall("artist"):
                     artist_id = artist.find("id")
-                    if artist_id is not None:
+                    if artist_id is not None and artist_id.text not in PLACEHOLDER_ARTIST_IDS:
                         writers["artist_release_links"].writerow([
                             artist_id.text,
                             release_id
