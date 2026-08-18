@@ -22,12 +22,23 @@ for f in artists.csv groups.csv labels.csv releases.csv \
     fi
 done
 
-# --multiline-fields is required because Discogs profile text contains newlines.
+# --multiline-fields is required because Discogs profile text contains newlines:
+# a label profile can run to several lines inside one quoted field.
 #
-# Add --skip-bad-relationships=true if the import aborts on dangling SUBLABEL
-# rows: sublabels are only written to label_sublabel_links.csv, on the
-# assumption that every sublabel also appears as a top-level <label> in the
-# labels dump. That holds for full dumps but not for partial ones.
+# neo4j-admin writes its bad-rows report to "import.report" *relative to the
+# current directory*, and provisioning runs from / (cloud-init's cwd, which
+# sudo -u does not change), where the unprivileged neo4j user cannot write.
+# Name the path explicitly, and cd somewhere writable in case anything else is
+# resolved relative to cwd.
+REPORT_FILE="${REPORT_FILE:-$CSV_DIR/import.report}"
+cd "$CSV_DIR"
+
+# --skip-bad-relationships with a bounded tolerance: a sublabel that never
+# appears as a top-level <label> yields a dangling SUBLABEL row, which is
+# expected and harmless. The tolerance is deliberately far below the size of any
+# single relationship file (the smallest is ~300k rows, the largest ~14M), so a
+# systemic fault -- edges written into the wrong ID space, say -- still aborts
+# the import rather than being silently skipped.
 neo4j-admin database import full "$DATABASE" \
     --nodes=Artist="$CSV_DIR/artists.csv" \
     --nodes=Group="$CSV_DIR/groups.csv" \
@@ -38,4 +49,15 @@ neo4j-admin database import full "$DATABASE" \
     --relationships=SUBLABEL="$CSV_DIR/label_sublabel_links.csv" \
     --relationships=RELEASED_ON="$CSV_DIR/release_label_links.csv" \
     --multiline-fields=true \
+    --skip-bad-relationships=true \
+    --bad-tolerance=250000 \
+    --report-file="$REPORT_FILE" \
     --overwrite-destination
+
+# Surface anything that was skipped: silence here means a clean import.
+if [[ -s "$REPORT_FILE" ]]; then
+    echo
+    echo "$(wc -l < "$REPORT_FILE") rows were skipped; first few:"
+    head -5 "$REPORT_FILE"
+    echo "full report: $REPORT_FILE"
+fi
