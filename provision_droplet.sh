@@ -35,7 +35,18 @@ DATA_DIR="${DATA_DIR:-/var/lib/music-graph/data}"
 CSV_DIR="${CSV_DIR:-$DATA_DIR/csv}"
 REPO_DIR="${REPO_DIR:-/opt/music-graph}"
 REPO_URL="${REPO_URL:-https://github.com/prehensile/music-graph.git}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
+# Default to the branch this checkout is already on, NOT to main. fetch_repo
+# does `checkout` + `reset --hard`, so a hardcoded default silently moved an
+# existing working copy onto main -- discarding whatever it was running -- the
+# moment anyone invoked the script by hand without exporting REPO_BRANCH.
+# Falls back to main only when there is no checkout to read, i.e. a first clone.
+current_branch() {
+    local branch
+    branch=$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || return 1   # detached: no name
+    printf '%s' "$branch"
+}
+REPO_BRANCH="${REPO_BRANCH:-$(current_branch || echo main)}"
 # Only needed if REPO_URL is private. See fetch_repo() for the caveats.
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 # Community Edition serves exactly one user database, so import into the
@@ -246,7 +257,13 @@ fetch_repo() {
     fi
 
     if [[ -d "$REPO_DIR/.git" ]]; then
-        echo "  updating repo in $REPO_DIR"
+        local on_branch
+        on_branch=$(current_branch || echo "(detached)")
+        if [[ "$on_branch" != "$REPO_BRANCH" ]]; then
+            echo "  NOTE: switching $REPO_DIR from '$on_branch' to '$REPO_BRANCH'" >&2
+            echo "  Set REPO_BRANCH if that is not what you want." >&2
+        fi
+        echo "  updating repo in $REPO_DIR (branch $REPO_BRANCH)"
         git "${git_auth[@]}" -C "$REPO_DIR" fetch --quiet origin "$REPO_BRANCH"
         git -C "$REPO_DIR" checkout --quiet "$REPO_BRANCH"
         git -C "$REPO_DIR" reset --hard --quiet "origin/$REPO_BRANCH"
