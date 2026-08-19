@@ -74,6 +74,9 @@ const PAGE_BG = '#0b1120';
 // built in initRenderer, not a canvas stroke.
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
+// Opacity for nodes on screen that aren't directly connected to whichever
+// node is currently hovered -- see reduceNode.
+const FADE_ALPHA = 0.5;
 
 // Node size grows fast with degree up to about SIZE_KNEE connections, then
 // flattens -- a hub with hundreds of connections should not dwarf everything
@@ -86,6 +89,13 @@ const SIZE_KNEE = 10;
 const SIZE_SCALE = 0.9 * (SIZE_MAX - SIZE_MIN) / Math.log2(SIZE_KNEE + 1);
 
 const $ = (id) => document.getElementById(id);
+
+// '#rrggbb' -> 'rgba(r,g,b,alpha)', for fading a node's fill/border colour at
+// render time (see reduceNode) without touching its stored `color` attribute.
+function withAlpha(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
 
 /*
  * Custom hover-label renderer, wired in via the `defaultDrawNodeHover`
@@ -157,6 +167,10 @@ class Viewer {
     this.activeSuggestions = [];
     this.highlightedSuggestion = -1;
 
+    // Hover-fade state, read by reduceNode -- null when nothing is hovered.
+    this.hoveredNode = null;
+    this.hoveredNeighbours = null;
+
     this.initRenderer();
     this.initLegend();
     this.bindEvents();
@@ -173,9 +187,13 @@ class Viewer {
     // but ships no UMD build of its own and would need a bundler to vendor.
     // Concentric rings from the outside in: a fixed-width white ring, then the
     // node's own colour filling the rest.
+    // The outer ring's colour is per-node (`attribute`, not `value`) so
+    // reduceNode can fade it along with the fill on hover -- a `value` border
+    // is one fixed uniform for every node in the draw call, with no per-node
+    // override possible.
     const nodeProgram = Sigma.rendering.createNodeBorderProgram({
       borders: [
-        { size: { value: OUTLINE_WIDTH, mode: 'pixels' }, color: { value: OUTLINE_COLOR } },
+        { size: { value: OUTLINE_WIDTH, mode: 'pixels' }, color: { attribute: 'borderColor', defaultValue: OUTLINE_COLOR } },
         { size: { fill: true }, color: { attribute: 'color' } },
       ],
     });
@@ -200,6 +218,11 @@ class Viewer {
       // renderer-wide fallback used when a program (like the border one
       // above) doesn't set its own `drawHover`.
       defaultDrawNodeHover: drawHoverLabel,
+      // Render-time only -- fades everything except the hovered node and its
+      // direct neighbours, without touching the graph's own `color`
+      // attribute (which the legend, panel etc. all still read at full
+      // strength). See enterNode/leaveNode for what drives it.
+      nodeReducer: (node, data) => this.reduceNode(node, data),
     });
 
     // The info panel is a constant fixture, not a popup -- it always shows
@@ -207,11 +230,15 @@ class Viewer {
     // closing per interaction.
     this.renderer.on('enterNode', ({ node }) => {
       document.body.style.cursor = 'pointer';
+      this.hoveredNode = node;
+      this.hoveredNeighbours = new Set(this.graph.neighbors(node));
       this.setHighlight(node);
       this.showPanel(node);
     });
     this.renderer.on('leaveNode', () => {
       document.body.style.cursor = 'default';
+      this.hoveredNode = null;
+      this.hoveredNeighbours = null;
       this.setHighlight(null);
     });
     this.renderer.on('clickNode', ({ node }) => {
@@ -219,7 +246,11 @@ class Viewer {
       if (this.didDrag) { this.didDrag = false; return; }
       this.activate(node);
     });
-    this.renderer.on('clickStage', () => this.setHighlight(null));
+    this.renderer.on('clickStage', () => {
+      this.hoveredNode = null;
+      this.hoveredNeighbours = null;
+      this.setHighlight(null);
+    });
 
     this.bindDrag();
   }
@@ -707,6 +738,20 @@ class Viewer {
   setHighlight(nodeId) {
     this.graph.forEachNode((n) => this.graph.setNodeAttribute(n, 'highlighted', n === nodeId));
     this.renderer.refresh();
+  }
+
+  /*
+   * nodeReducer: on hover, fades every on-screen node that isn't the hovered
+   * node itself or one of its direct neighbours, restoring full opacity as
+   * soon as nothing is hovered (this.hoveredNode is null on rollout). Purely
+   * a render-time override -- the graph's own `color` attribute is untouched,
+   * so nothing else that reads it (legend, panel) needs to know about this.
+   */
+  reduceNode(node, data) {
+    if (!this.hoveredNode || node === this.hoveredNode || this.hoveredNeighbours.has(node)) {
+      return data;
+    }
+    return { ...data, color: withAlpha(data.color, FADE_ALPHA), borderColor: withAlpha(OUTLINE_COLOR, FADE_ALPHA) };
   }
 
   /*
