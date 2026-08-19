@@ -26,15 +26,19 @@ body {
 
 /* ------------------------------------------------------------------ header */
 
-/* Grid, not flex: a flex-basis hint on #search-form only ever set its
-   *starting* size, and flexbox was free to just... not grow it to fill the
-   row beyond that. `minmax(0, 1fr)` has no such ambiguity -- that column
-   *is* everything left over after h1's own width, full stop. */
+/* Rebuilt as a stack, title above search, rather than a row the two share --
+   two rounds of "make the shared row split differently" (flex-basis, then
+   grid) both left the search box unchanged, despite the served CSS
+   checking out correct each time. A stacked layout sidesteps that question
+   entirely: #search-form is the only thing on its row, so it's full width
+   by construction, not by however a division of one row against h1 works
+   out. Same at every viewport width, so the old mobile-only override
+   (header's grid-template-columns collapsing to 1fr under 560px) is gone
+   too -- nothing left for it to do. */
 header {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   padding: 10px 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--edge);
@@ -42,16 +46,15 @@ header {
 
 h1 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.3px;
-  white-space: nowrap;
 }
 
 #search-form {
   display: flex;
   gap: 8px;
-  min-width: 0;
+  width: 100%;
 }
 
 input[type="search"] {
@@ -335,10 +338,6 @@ footer a.linkish { text-decoration: underline; }
 }
 
 @media (max-width: 560px) {
-  h1 { font-size: 15px; }
   #counts { display: none; }
   #panel { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; max-height: 52%; }
-  /* h1 and the search form each claim a full row of their own instead of
-     sharing one. */
-  header { grid-template-columns: 1fr; }
 }
