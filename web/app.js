@@ -29,11 +29,34 @@ const REL_LABEL = {
   SUBLABEL:    'sublabel of',
 };
 
+// discogs.com's own URL path per kind -- Group has no separate URL space
+// there, it rides on Artist's "/artist/" path same as a solo performer.
+const DISCOGS_PATH = {
+  Artist: 'artist',
+  Group:  'artist',
+  Release: 'release',
+  Label:  'label',
+};
+
+// Builds the real discogs.com page for a node from its raw Discogs id (see
+// server.py's discogsId, read off the artistId/groupId/releaseId/labelId
+// property the import gave it) -- null if this kind has no Discogs page or
+// the node came through without one.
+function discogsUrl(kind, discogsId) {
+  const path = DISCOGS_PATH[kind];
+  if (!path || discogsId === null || discogsId === undefined) return null;
+  return `https://www.discogs.com/${path}/${discogsId}`;
+}
+
 // Live search (see fetchSuggestions): wait this long after the last keystroke
 // before hitting /api/suggest, and don't bother firing below this many chars
 // -- both keep a fast typist from spamming the endpoint on every keystroke.
 const SUGGEST_DEBOUNCE_MS = 180;
 const SUGGEST_MIN_CHARS = 2;
+
+// How long a clicked/tapped node's panel resists being overwritten by
+// hovering past other nodes en route to it -- see stickPanel.
+const STICKY_MS = 6000;
 
 // Tuned for a viewport-ish 820x820 spread of a few hundred nodes -- see
 // physicsTick. SPRING pulls edges toward an AREA_SIDE/nodeCount-derived `k`;
@@ -251,6 +274,13 @@ class Viewer {
     this.fadeTarget = 0;
     this.fadeRaf = null;
 
+    // A tapped/clicked node's panel content resists being overwritten by
+    // hovering past other nodes on the way to it -- e.g. its Discogs link,
+    // which sits off-canvas -- for STICKY_MS after the click. See
+    // stickPanel/showPanel.
+    this.stickyNode = null;
+    this.stickyTimer = null;
+
     this.initRenderer();
     this.initLegend();
     this.bindEvents();
@@ -335,7 +365,11 @@ class Viewer {
       this.fadeTarget = FADE_MIX;
       this.animateFade();
       this.setHighlight(node);
-      this.showPanel(node);
+      // A sticky node (see stickPanel) holds the panel through a hover
+      // elsewhere -- e.g. crossing another node while the pointer heads for
+      // the panel's own Discogs link, off-canvas -- except hovering the
+      // sticky node itself, which is just the content it already shows.
+      if (!this.stickyNode || this.stickyNode === node) this.showPanel(node);
     });
     this.renderer.on('leaveNode', () => {
       document.body.style.cursor = 'default';
@@ -352,6 +386,10 @@ class Viewer {
       this.fadeTarget = 0;
       this.animateFade();
       this.setHighlight(null);
+      // A deliberate click on empty space reads as "done with that node" --
+      // release the sticky hold early rather than making them wait it out.
+      if (this.stickyTimer) { clearTimeout(this.stickyTimer); this.stickyTimer = null; }
+      this.stickyNode = null;
     });
 
     this.bindDrag();
@@ -516,6 +554,10 @@ class Viewer {
     this.fadeCurrent = 0;
     this.fadeTarget = 0;
     this.setHighlight(null);
+    // Same reasoning as the fade state above -- a sticky hold from the
+    // previous graph has nothing valid left to hold onto.
+    if (this.stickyTimer) { clearTimeout(this.stickyTimer); this.stickyTimer = null; }
+    this.stickyNode = null;
   }
 
   // ---------------------------------------------------------- live search
@@ -838,6 +880,7 @@ class Viewer {
    */
   async activate(nodeId) {
     if (!this.graph.hasNode(nodeId)) return;
+    this.stickPanel(nodeId);
     this.showPanel(nodeId);
 
     if (this.expanded.has(nodeId)) return;
@@ -863,6 +906,21 @@ class Viewer {
   setHighlight(nodeId) {
     this.graph.forEachNode((n) => this.graph.setNodeAttribute(n, 'highlighted', n === nodeId));
     this.renderer.refresh();
+  }
+
+  // Marks nodeId as holding the panel for STICKY_MS -- see enterNode, which
+  // is what actually withholds a hover-driven update while a node is
+  // sticky. A second click (this node or another) restarts the window
+  // rather than stacking; expiring just releases the hold; whatever's
+  // hovered (or still this node) at that point carries on updating the
+  // panel normally.
+  stickPanel(nodeId) {
+    this.stickyNode = nodeId;
+    if (this.stickyTimer) clearTimeout(this.stickyTimer);
+    this.stickyTimer = setTimeout(() => {
+      this.stickyNode = null;
+      this.stickyTimer = null;
+    }, STICKY_MS);
   }
 
   /*
@@ -1034,6 +1092,13 @@ class Viewer {
     $('panel-meta').innerHTML = rows
       .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
     $('panel-profile').textContent = a.profile || '';
+
+    // null for a node type discogs.com has no page for, or one missing its
+    // own id -- hide the link rather than send someone to a broken URL.
+    const link = $('panel-link');
+    const url = discogsUrl(a.kind, a.discogsId);
+    link.hidden = !url;
+    if (url) link.href = url;
   }
 
   clear() {
@@ -1046,6 +1111,7 @@ class Viewer {
     $('panel-title').textContent = 'Hover a node';
     $('panel-meta').innerHTML = '';
     $('panel-profile').textContent = 'Tap or hover any node to see its details here.';
+    $('panel-link').hidden = true;
     $('q').value = '';
     $('hint').hidden = false;
     this.renderer.refresh();

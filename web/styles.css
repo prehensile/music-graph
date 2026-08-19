@@ -293,6 +293,20 @@ main {
   overflow-wrap: anywhere;
 }
 
+.panel-link {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+}
+
+.panel-link:hover { background: rgba(56, 189, 248, 0.12); }
+.panel-link[hidden] { display: none; }
+
 /* ------------------------------------------------------------------ footer */
 
 footer {

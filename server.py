@@ -56,6 +56,14 @@ LOG_TAIL_BYTES = 64 * 1024
 LOG_TAIL_LINES = 200
 
 NODE_LABELS = ("Artist", "Group", "Release", "Label")
+# Property holding each label's original Discogs numeric id -- see the CSV
+# headers in discogs_to_neo4j.py (e.g. "artistId:ID(Entity)"), which is also
+# the property name neo4j-admin import stores it under. Distinct from a
+# node's own elementId (this app's "id" everywhere else), which is a Neo4j
+# identifier with no meaning to discogs.com. Sent to the client as
+# "discogsId" so the panel can link out to the real Discogs page -- app.js's
+# discogsUrl() builds the actual URL, this is just which property to read.
+DISCOGS_ID_PROPERTY = {"Artist": "artistId", "Group": "groupId", "Release": "releaseId", "Label": "labelId"}
 # The four relationship types in the Data Model (see CLAUDE.md), ordered
 # rarest/structural first: a Group's few MEMBER_OF edges or a Label's few
 # SUBLABEL edges should never lose out to a node's own CREDITED or
@@ -440,11 +448,15 @@ class Graph:
             if eid in nodes:
                 return
             labels = list(node.labels)
+            kind = labels[0] if labels else "Unknown"
             props = dict(node)
+            # The raw Discogs id only -- see DISCOGS_ID_PROPERTY -- the URL
+            # itself is built client-side (app.js's discogsUrl()).
             nodes[eid] = {
                 "id": eid,
-                "label": labels[0] if labels else "Unknown",
+                "label": kind,
                 "title": props.get("name") or props.get("title") or "(untitled)",
+                "discogsId": props.get(DISCOGS_ID_PROPERTY.get(kind, "")),
                 "year": props.get("year") or "",
                 "realname": props.get("realname") or "",
                 # Profiles run to thousands of words; the panel only previews.
