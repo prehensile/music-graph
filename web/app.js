@@ -75,19 +75,27 @@ const PAGE_BG = '#0b1120';
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
 const LABEL_COLOR = '#e2e8f0';
-// Opacity floor for nodes/edges/labels on screen that aren't directly
-// connected to whichever node is currently hovered -- see reduceNode/reduceEdge.
+// How far nodes/labels/edges on screen that aren't directly connected to
+// whichever node is currently hovered tween toward PAGE_BG -- see
+// reduceNode/reduceEdge/lerpToBg. 0 = untouched, 1 = fully the background
+// colour. Colour-tweened rather than alpha-faded: an alpha-faded node is
+// genuinely translucent, so whatever happens to be drawn behind it at that
+// moment -- an edge, another node -- shows through it, which reads as a
+// rendering glitch rather than "dimmed". A solid, darker colour has no such
+// dependency on what's underneath.
 // The transition toward and away from it is animated (see animateFade),
 // eased FADE_EASE of the remaining distance per frame; FADE_SNAP is how
 // close counts as "arrived", to stop the animation loop rather than
 // chasing an imperceptible remainder forever.
-const FADE_ALPHA = 0.2;
+const FADE_MIX = 0.82;
 const FADE_EASE = 0.25;
 const FADE_SNAP = 0.004;
 // Edges have no per-edge colour of their own (see the addEdge call in
 // merge()) -- EDGE_RGB/EDGE_ALPHA are the base grey both the default colour
-// (EDGE_COLOR, built below once rgbaPremultiplied exists) and reduceEdge's
-// animated faded one are derived from.
+// (EDGE_COLOR, built below) and reduceEdge's tweened one are derived from.
+// Edges keep their normal alpha even while faded -- translucent edges are
+// the intended baseline look (see EDGE_COLOR), not a side effect of fading
+// -- only their colour tweens toward the background.
 const EDGE_RGB = [148, 163, 184];
 const EDGE_ALPHA = 0.35;
 
@@ -109,32 +117,44 @@ const $ = (id) => document.getElementById(id);
 // colour. Fed a colour at less than full alpha, that combination adds the
 // *full-brightness* colour on top of only (1 - alpha) of the background,
 // rather than fading it toward the background: against this app's near-black
-// bg that overshoot reads as barely-dimmed-at-all, which is exactly the "no
-// brightness change" symptom. Baking the alpha into r/g/b ourselves --
-// producing genuinely premultiplied output -- is what the blend func was
-// actually expecting, and makes alpha behave as alpha.
+// bg that overshoot reads as barely-dimmed-at-all. Baking the alpha into
+// r/g/b ourselves -- producing genuinely premultiplied output -- is what the
+// blend func was actually expecting, and makes alpha behave as alpha. Only
+// EDGE_COLOR (below) still needs this -- the hover fade itself no longer
+// varies alpha at all, see FADE_MIX.
 function rgbaPremultiplied(r, g, b, alpha) {
   return `rgba(${Math.round(r * alpha)},${Math.round(g * alpha)},${Math.round(b * alpha)},${alpha})`;
 }
 
-// '#rrggbb' -> premultiplied rgba(), for fading a node's fill/border colour
-// at render time (see reduceNode) without touching its stored `color`
-// attribute.
-function withAlpha(hex, alpha) {
+function hexToRgb(hex) {
   const n = parseInt(hex.slice(1), 16);
-  return rgbaPremultiplied((n >> 16) & 255, (n >> 8) & 255, n & 255, alpha);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-// Labels are drawn on a plain 2D canvas (see drawDiscNodeLabel/Jt in the
-// vendored sigma), not WebGL -- fillStyle composites with ordinary
-// (non-premultiplied) alpha, so unlike withAlpha above this must NOT
-// premultiply, or the label would fade twice as fast as the node it labels.
-function withAlphaCanvas(hex, alpha) {
-  const n = parseInt(hex.slice(1), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+const PAGE_BG_RGB = hexToRgb(PAGE_BG);
+
+// Tweens `hex` toward the page background by fraction `t` (0..1) and hands
+// back a fully-opaque colour -- see FADE_MIX for why this replaces alpha for
+// the hover fade. `rgb()` without an alpha component parses as opaque in
+// both the WebGL colour parser and canvas fillStyle, so one helper covers
+// reduceNode's fill/border and labelColor alike.
+function lerpToBg(hex, t) {
+  const [r, g, b] = hexToRgb(hex);
+  const [br, bg, bb] = PAGE_BG_RGB;
+  return `rgb(${Math.round(r + (br - r) * t)},${Math.round(g + (bg - g) * t)},${Math.round(b + (bb - b) * t)})`;
 }
 
 const EDGE_COLOR = rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA);
+
+// reduceEdge's faded variant: EDGE_RGB tweened toward the background by `t`,
+// same as lerpToBg, but at EDGE_ALPHA rather than fully opaque -- edges stay
+// translucent at their normal baseline throughout, see EDGE_ALPHA above --
+// so still needs premultiplying.
+function edgeColorAt(t) {
+  const [br, bg, bb] = PAGE_BG_RGB;
+  const [r, g, b] = EDGE_RGB;
+  return rgbaPremultiplied(r + (br - r) * t, g + (bg - g) * t, b + (bb - b) * t, EDGE_ALPHA);
+}
 
 /*
  * Custom hover-label renderer, wired in via the `defaultDrawNodeHover`
@@ -207,16 +227,17 @@ class Viewer {
     this.highlightedSuggestion = -1;
 
     // Hover-fade state. hoveredNode/hoveredNeighbours are what's exempt from
-    // fading; fadeCurrent is the live, animated alpha applied to everything
-    // else (see animateFade), easing toward fadeTarget rather than snapping.
-    // hoveredNode/hoveredNeighbours stay set through a roll-out (fadeTarget
-    // back to 1) until fadeCurrent actually gets there -- nulling them the
-    // instant the pointer leaves would leave nothing exempt while that
-    // transition was still playing.
+    // fading; fadeCurrent is the live, animated tween-toward-background
+    // fraction applied to everything else (see animateFade/lerpToBg),
+    // easing toward fadeTarget (0 = normal, FADE_MIX = fully faded) rather
+    // than snapping. hoveredNode/hoveredNeighbours stay set through a
+    // roll-out (fadeTarget back to 0) until fadeCurrent actually gets there
+    // -- nulling them the instant the pointer leaves would leave nothing
+    // exempt while that transition was still playing.
     this.hoveredNode = null;
     this.hoveredNeighbours = null;
-    this.fadeCurrent = 1;
-    this.fadeTarget = 1;
+    this.fadeCurrent = 0;
+    this.fadeTarget = 0;
     this.fadeRaf = null;
 
     this.initRenderer();
@@ -251,7 +272,7 @@ class Viewer {
       defaultNodeColor: COLOURS.Unknown,
       defaultEdgeColor: EDGE_COLOR,
       // `attribute` lets reduceNode override a faded node's label colour the
-      // same way it overrides fill/border -- see withAlphaCanvas.
+      // same way it overrides fill/border -- see lerpToBg.
       labelColor: { attribute: 'labelColor', color: LABEL_COLOR },
       labelSize: 12,
       labelWeight: '500',
@@ -283,14 +304,14 @@ class Viewer {
       document.body.style.cursor = 'pointer';
       this.hoveredNode = node;
       this.hoveredNeighbours = new Set(this.graph.neighbors(node));
-      this.fadeTarget = FADE_ALPHA;
+      this.fadeTarget = FADE_MIX;
       this.animateFade();
       this.setHighlight(node);
       this.showPanel(node);
     });
     this.renderer.on('leaveNode', () => {
       document.body.style.cursor = 'default';
-      this.fadeTarget = 1;
+      this.fadeTarget = 0;
       this.animateFade();
       this.setHighlight(null);
     });
@@ -300,7 +321,7 @@ class Viewer {
       this.activate(node);
     });
     this.renderer.on('clickStage', () => {
-      this.fadeTarget = 1;
+      this.fadeTarget = 0;
       this.animateFade();
       this.setHighlight(null);
     });
@@ -464,8 +485,8 @@ class Viewer {
     if (this.fadeRaf) { cancelAnimationFrame(this.fadeRaf); this.fadeRaf = null; }
     this.hoveredNode = null;
     this.hoveredNeighbours = null;
-    this.fadeCurrent = 1;
-    this.fadeTarget = 1;
+    this.fadeCurrent = 0;
+    this.fadeTarget = 0;
     this.setHighlight(null);
   }
 
@@ -811,7 +832,7 @@ class Viewer {
    * one's roll-out finished) just changes fadeTarget under a loop that's
    * already running, so it picks up smoothly from wherever fadeCurrent
    * currently is rather than restarting. Only once fadeCurrent actually
-   * settles back at 1 (fully rolled out) are hoveredNode/hoveredNeighbours
+   * settles back at 0 (fully rolled out) are hoveredNode/hoveredNeighbours
    * cleared -- see the constructor comment for why.
    */
   animateFade() {
@@ -821,7 +842,7 @@ class Viewer {
       if (Math.abs(diff) < FADE_SNAP) {
         this.fadeCurrent = this.fadeTarget;
         this.fadeRaf = null;
-        if (this.fadeTarget === 1) {
+        if (this.fadeTarget === 0) {
           this.hoveredNode = null;
           this.hoveredNeighbours = null;
         }
@@ -836,34 +857,34 @@ class Viewer {
   }
 
   /*
-   * nodeReducer: fades every on-screen node that isn't the hovered node
-   * itself or one of its direct neighbours toward FADE_ALPHA, at whatever
-   * point animateFade's transition currently is. Purely a render-time
-   * override -- the graph's own `color`/`label` attributes are untouched,
-   * so nothing else that reads them (legend, panel) needs to know about
-   * this.
+   * nodeReducer: tweens every on-screen node that isn't the hovered node
+   * itself or one of its direct neighbours toward the background colour, at
+   * whatever point animateFade's transition currently is (see FADE_MIX for
+   * why colour, not alpha). Purely a render-time override -- the graph's own
+   * `color`/`label` attributes are untouched, so nothing else that reads
+   * them (legend, panel) needs to know about this.
    */
   reduceNode(node, data) {
-    if (this.fadeCurrent >= 1 || node === this.hoveredNode || this.hoveredNeighbours?.has(node)) {
+    if (this.fadeCurrent <= 0 || node === this.hoveredNode || this.hoveredNeighbours?.has(node)) {
       return data;
     }
     return {
       ...data,
-      color: withAlpha(data.color, this.fadeCurrent),
-      borderColor: withAlpha(OUTLINE_COLOR, this.fadeCurrent),
-      labelColor: withAlphaCanvas(LABEL_COLOR, this.fadeCurrent),
+      color: lerpToBg(data.color, this.fadeCurrent),
+      borderColor: lerpToBg(OUTLINE_COLOR, this.fadeCurrent),
+      labelColor: lerpToBg(LABEL_COLOR, this.fadeCurrent),
     };
   }
 
   /*
    * edgeReducer counterpart to reduceNode: every edge not touching the
-   * hovered node fades the same way; edges into/out of it are left alone.
+   * hovered node tweens the same way; edges into/out of it are left alone.
    */
   reduceEdge(edge, data) {
-    if (this.fadeCurrent >= 1) return data;
+    if (this.fadeCurrent <= 0) return data;
     const [source, target] = this.graph.extremities(edge);
     if (source === this.hoveredNode || target === this.hoveredNode) return data;
-    return { ...data, color: rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA * this.fadeCurrent) };
+    return { ...data, color: edgeColorAt(this.fadeCurrent) };
   }
 
   /*
