@@ -36,16 +36,24 @@ const SUGGEST_DEBOUNCE_MS = 180;
 const SUGGEST_MIN_CHARS = 2;
 
 // Tuned for a viewport-ish 820x820 spread of a few hundred nodes -- see
-// physicsTick. REPULSE/SPRING set the forces, DAMPING is what makes them
-// settle instead of oscillating forever, and MAX_AWAKE_FRAMES is a safety
-// valve in case some pathological layout never quite dips under SLEEP_ENERGY.
+// physicsTick. SPRING pulls edges toward an AREA_SIDE/nodeCount-derived `k`;
+// REPULSE no longer references `k` at all, it's mass-based -- see below.
+// DAMPING is what makes forces settle instead of oscillating forever, and
+// MAX_AWAKE_FRAMES is a safety valve in case some pathological layout never
+// quite dips under SLEEP_ENERGY.
 const AREA_SIDE = 820;
-const REPULSE_K = 0.35;
-// How much of a node pair's own drawn radius (see sizeFor) gets added to `k`
-// as extra required separation -- 0 would repeat the old size-blind
-// behaviour, 1 would demand a full gap equal to their combined radii. 1.8
-// leaves a generous margin between two touching hubs rather than just
-// preventing their circles from intersecting.
+// Repulsion is gravity-style: force = REPULSE_K * size_i * size_j / d^2, so
+// it scales with a pair's own drawn sizes (see sizeFor), not node count or
+// viewport. Two touching hubs (size ~26 each, mass 676) generate ~42x the
+// force two touching leaves (size ~4 each, mass 16) do at the same distance
+// -- hand-tuned so a typical mid-size pair feels roughly as strong as the
+// old k-anchored scheme did.
+const REPULSE_K = 45;
+// How close (in drawn-radius units) a pair's repulsion is allowed to treat
+// them as being, at minimum -- below this, the force stops climbing toward
+// infinity as d -> 0 and plateaus instead. 0 would let coincident nodes
+// generate unbounded force; 1 is roughly their combined radii; 1.8 leaves a
+// generous margin between two touching hubs.
 const SIZE_REPULSE_PAD = 1.8;
 const SPRING_K = 0.03;
 const DAMPING = 0.82;
@@ -562,23 +570,26 @@ class Viewer {
     if (!nodes.length) { this.raf = null; return; }
 
     const g = this.graph;
-    const k = Math.sqrt((AREA_SIDE * AREA_SIDE) / nodes.length); // ideal separation
+    const k = Math.sqrt((AREA_SIDE * AREA_SIDE) / nodes.length); // ideal separation, springs only -- see below
     const index = new Map(nodes.map((n, i) => [n, i]));
     const pos = nodes.map((n) => g.getNodeAttributes(n));
     const fx = new Float64Array(nodes.length);
     const fy = new Float64Array(nodes.length);
 
-    // Repulsion: every pair pushes apart, inverse-square, so distant nodes
-    // barely feel it but crowded ones spring open -- this is what makes a
-    // dragged node shove its neighbours out of the way in real time.
+    // Repulsion: every pair pushes apart, gravity-style -- strength is the
+    // product of the pair's own drawn sizes (see sizeFor), not `k`/viewport
+    // density. A hub's mass grows independently as more of its neighbourhood
+    // merges in, so two hubs now generate a much stronger field at any given
+    // distance than two leaf nodes do (mass product runs from ~16 at two
+    // leaves to ~676 at two maxed-out hubs). That's what stops hubs settling
+    // into knots -- the old k-anchored target was the same for every pair
+    // regardless of size, so it could not push big nodes apart any harder
+    // than small ones.
     //
-    // The target separation is `k` widened by the pair's own drawn size, not
-    // `k` alone. `k` only knows the node *count* (see above), but a hub's
-    // size grows independently as more of its neighbourhood gets merged in
-    // (see sizeFor) -- without this, a big node's springs could settle its
-    // neighbours at distance `k` while `k` itself was smaller than the two
-    // nodes' combined radii, leaving them visually overlapping however
-    // "correctly spaced" the force model considered them.
+    // `floor` is the minimum clearance a pair is allowed to close to --
+    // below it, the force is computed as if they were still `floor` apart
+    // rather than climbing toward infinity, so two coincident hubs get a
+    // strong but bounded shove instead of a velocity spike.
     for (let i = 0; i < nodes.length; i += 1) {
       for (let j = i + 1; j < nodes.length; j += 1) {
         let ax = pos[i].x - pos[j].x;
@@ -590,8 +601,9 @@ class Viewer {
           d2 = ax * ax + ay * ay || 0.01;
         }
         const d = Math.sqrt(d2);
-        const target = k + (pos[i].size + pos[j].size) * SIZE_REPULSE_PAD;
-        const f = REPULSE_K * (target * target) / d2;
+        const floor = (pos[i].size + pos[j].size) * SIZE_REPULSE_PAD;
+        const dEff = Math.max(d, floor);
+        const f = REPULSE_K * (pos[i].size * pos[j].size) / (dEff * dEff);
         fx[i] += (ax / d) * f; fy[i] += (ay / d) * f;
         fx[j] -= (ax / d) * f; fy[j] -= (ay / d) * f;
       }
