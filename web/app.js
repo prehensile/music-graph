@@ -64,43 +64,66 @@ const STICKY_MS = 6000;
 // DAMPING is what makes forces settle instead of oscillating forever, and
 // MAX_AWAKE_FRAMES is a safety valve in case some pathological layout never
 // quite dips under SLEEP_ENERGY.
-const AREA_SIDE = 820;
-// Repulsion is gravity-style: force = REPULSE_K * size_i * size_j / d^2, so
-// it scales with a pair's own drawn sizes (see sizeFor), not node count or
-// viewport. Two touching hubs (size ~26 each, mass 676) generate ~42x the
-// force two touching leaves (size ~4 each, mass 16) do at the same distance.
-// Bumping REPULSE_K adds force proportional to size_i * size_j, so the
-// increase lands almost entirely on massy pairs (hub-hub, hub-leaf) and
-// barely touches leaf-leaf ones -- raised 45 -> 90 after hubs were still
-// settling into knots, their springs (which pull toward the count-derived
-// `k`, blind to node size) out-muscling the plateaued repulsion at close
-// range; raised again 90 -> 160 once removing the layout's centring gravity
-// entirely made that same knotting visible again -- gravity's constant
-// inward pull had been partly masking under-strength repulsion by keeping
-// everything nearer the centre rather than letting hubs actually spread
-// apart.
-const REPULSE_K = 160;
-// How close (in drawn-radius units) a pair's repulsion is allowed to treat
-// them as being, at minimum -- below this, the force stops climbing toward
-// infinity as d -> 0 and plateaus instead. 0 would let coincident nodes
-// generate unbounded force; 1 is roughly their combined radii; 1.8 leaves a
-// generous margin between two touching hubs.
-const SIZE_REPULSE_PAD = 1.8;
-const SPRING_K = 0.03;
-const DAMPING = 0.82;
-// No centring gravity at all -- there used to be one (first a pull felt at
-// every radius, then narrowed to a dead-zone wall past GRAVITY_RADIUS), and
-// both versions still visibly rounded the graph off into a circle over
-// time. Any force pointed at a fixed origin is isotropic in the same way
-// repulsion is, so the two together always have a single equilibrium shape
-// -- a disc -- regardless of the graph's actual edges; narrowing where it
-// kicked in just shrank the effect, it didn't remove it. Without it a
-// component that repulsion pushes away from the rest just drifts until
-// repulsion is too weak to matter and damping settles it there -- fine,
-// since sigma auto-fits the camera to whatever the bounding box ends up
-// being (see beginNewGraph) rather than assuming a fixed frame.
-const SLEEP_ENERGY = 0.0004;   // average per-node kinetic energy to go idle
-const MAX_AWAKE_FRAMES = 900;  // ~15s at 60fps
+//
+// A mutable object, not bare consts, so the physics panel (see
+// initPhysicsPanel) can retune it live from the browser without a reload --
+// physicsTick reads PHYSICS.* every tick rather than closing over fixed
+// values. DEFAULT_PHYSICS is the untouched original, kept around for the
+// panel's own Reset button; PHYSICS starts as a shallow copy of it.
+const DEFAULT_PHYSICS = {
+  AREA_SIDE: 820,
+  // Repulsion is gravity-style: force = REPULSE_K * size_i * size_j / d^2,
+  // so it scales with a pair's own drawn sizes (see sizeFor), not node
+  // count or viewport. Two touching hubs (size ~26 each, mass 676) generate
+  // ~42x the force two touching leaves (size ~4 each, mass 16) do at the
+  // same distance. Bumping REPULSE_K adds force proportional to
+  // size_i * size_j, so the increase lands almost entirely on massy pairs
+  // (hub-hub, hub-leaf) and barely touches leaf-leaf ones -- raised
+  // 45 -> 90 after hubs were still settling into knots, their springs
+  // (which pull toward the count-derived `k`, blind to node size)
+  // out-muscling the plateaued repulsion at close range; raised again
+  // 90 -> 160 once removing the layout's centring gravity entirely made
+  // that same knotting visible again -- gravity's constant inward pull had
+  // been partly masking under-strength repulsion by keeping everything
+  // nearer the centre rather than letting hubs actually spread apart.
+  REPULSE_K: 160,
+  // How close (in drawn-radius units) a pair's repulsion is allowed to
+  // treat them as being, at minimum -- below this, the force stops
+  // climbing toward infinity as d -> 0 and plateaus instead. 0 would let
+  // coincident nodes generate unbounded force; 1 is roughly their combined
+  // radii; 1.8 leaves a generous margin between two touching hubs.
+  SIZE_REPULSE_PAD: 1.8,
+  SPRING_K: 0.03,
+  DAMPING: 0.82,
+  // No centring gravity at all -- there used to be one (first a pull felt
+  // at every radius, then narrowed to a dead-zone wall), and both versions
+  // still visibly rounded the graph off into a circle over time. Any force
+  // pointed at a fixed origin is isotropic in the same way repulsion is,
+  // so the two together always have a single equilibrium shape -- a disc
+  // -- regardless of the graph's actual edges; narrowing where it kicked
+  // in just shrank the effect, it didn't remove it. Without it a component
+  // that repulsion pushes away from the rest just drifts until repulsion
+  // is too weak to matter and damping settles it there -- fine, since
+  // sigma auto-fits the camera to whatever the bounding box ends up being
+  // (see beginNewGraph) rather than assuming a fixed frame.
+  SLEEP_ENERGY: 0.0004,   // average per-node kinetic energy to go idle
+  MAX_AWAKE_FRAMES: 900,  // ~15s at 60fps
+};
+const PHYSICS = { ...DEFAULT_PHYSICS };
+
+// Drives both the panel's slider rows and what Copy values writes out --
+// one source of truth for which of PHYSICS's keys are user-tunable, in what
+// range/step, and how many decimals are worth showing. Order here is
+// display order.
+const PHYSICS_PARAMS = [
+  { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 400, step: 5, decimals: 0 },
+  { key: 'SIZE_REPULSE_PAD', label: 'Repulsion floor', min: 1, max: 3, step: 0.05, decimals: 2 },
+  { key: 'SPRING_K', label: 'Spring strength', min: 0.005, max: 0.15, step: 0.005, decimals: 3 },
+  { key: 'DAMPING', label: 'Damping', min: 0.5, max: 0.95, step: 0.01, decimals: 2 },
+  { key: 'AREA_SIDE', label: 'Area side', min: 300, max: 2000, step: 20, decimals: 0 },
+  { key: 'SLEEP_ENERGY', label: 'Sleep threshold', min: 0.0001, max: 0.005, step: 0.0001, decimals: 4 },
+  { key: 'MAX_AWAKE_FRAMES', label: 'Max awake frames', min: 100, max: 3000, step: 50, decimals: 0 },
+];
 
 // Keep in sync with styles.css's --bg -- the hover label's text is knocked
 // out in this colour (see drawHoverLabel) so it reads as cut from the pill
@@ -301,6 +324,7 @@ class Viewer {
 
     this.initRenderer();
     this.initLegend();
+    this.initPhysicsPanel();
     this.bindEvents();
     this.loadStats();
   }
@@ -499,6 +523,62 @@ class Viewer {
         this.fadeTarget = 0;
         this.animateFade();
       });
+    });
+  }
+
+  /*
+   * A live tuning panel over PHYSICS, built from PHYSICS_PARAMS rather than
+   * one hardcoded row per constant -- adding a param to the array is enough
+   * to get it a slider. Each row writes straight into PHYSICS on 'input' and
+   * wakes the simulation, so a drag is felt immediately even if the layout
+   * had already gone to sleep. Hidden by default; toggled from the footer's
+   * "Physics" button. Reset restores DEFAULT_PHYSICS; Copy values writes the
+   * live PHYSICS out as a paste-able object literal, for taking whatever was
+   * hand-tuned here back into the source as the new defaults.
+   */
+  initPhysicsPanel() {
+    $('physics-controls').innerHTML = PHYSICS_PARAMS
+      .map((p) => `
+        <label class="physics-row" data-key="${p.key}">
+          <span class="physics-row-head">
+            <span>${p.label}</span>
+            <span class="physics-value">${PHYSICS[p.key].toFixed(p.decimals)}</span>
+          </span>
+          <input type="range" min="${p.min}" max="${p.max}" step="${p.step}" value="${PHYSICS[p.key]}">
+        </label>
+      `)
+      .join('');
+
+    PHYSICS_PARAMS.forEach((p) => {
+      const row = $('physics-controls').querySelector(`[data-key="${p.key}"]`);
+      const input = row.querySelector('input');
+      const value = row.querySelector('.physics-value');
+      input.addEventListener('input', () => {
+        PHYSICS[p.key] = Number(input.value);
+        value.textContent = PHYSICS[p.key].toFixed(p.decimals);
+        this.wake();
+      });
+    });
+
+    const panel = $('physics-panel');
+    $('physics-toggle').addEventListener('click', () => { panel.hidden = !panel.hidden; });
+    $('physics-close').addEventListener('click', () => { panel.hidden = true; });
+
+    $('physics-reset').addEventListener('click', () => {
+      Object.assign(PHYSICS, DEFAULT_PHYSICS);
+      PHYSICS_PARAMS.forEach((p) => {
+        const row = $('physics-controls').querySelector(`[data-key="${p.key}"]`);
+        row.querySelector('input').value = PHYSICS[p.key];
+        row.querySelector('.physics-value').textContent = PHYSICS[p.key].toFixed(p.decimals);
+      });
+      this.wake();
+    });
+
+    $('physics-copy').addEventListener('click', () => {
+      const body = PHYSICS_PARAMS.map((p) => `  ${p.key}: ${PHYSICS[p.key]},`).join('\n');
+      navigator.clipboard.writeText(`{\n${body}\n}`)
+        .then(() => this.toast('Physics values copied'))
+        .catch(() => this.toast('Copy failed -- clipboard unavailable'));
     });
   }
 
@@ -821,7 +901,7 @@ class Viewer {
     if (!nodes.length) { this.raf = null; return; }
 
     const g = this.graph;
-    const k = Math.sqrt((AREA_SIDE * AREA_SIDE) / nodes.length); // ideal separation, springs only -- see below
+    const k = Math.sqrt((PHYSICS.AREA_SIDE * PHYSICS.AREA_SIDE) / nodes.length); // ideal separation, springs only -- see below
     const index = new Map(nodes.map((n, i) => [n, i]));
     const pos = nodes.map((n) => g.getNodeAttributes(n));
     const fx = new Float64Array(nodes.length);
@@ -852,9 +932,9 @@ class Viewer {
           d2 = ax * ax + ay * ay || 0.01;
         }
         const d = Math.sqrt(d2);
-        const floor = (pos[i].size + pos[j].size) * SIZE_REPULSE_PAD;
+        const floor = (pos[i].size + pos[j].size) * PHYSICS.SIZE_REPULSE_PAD;
         const dEff = Math.max(d, floor);
-        const f = REPULSE_K * (pos[i].size * pos[j].size) / (dEff * dEff);
+        const f = PHYSICS.REPULSE_K * (pos[i].size * pos[j].size) / (dEff * dEff);
         fx[i] += (ax / d) * f; fy[i] += (ay / d) * f;
         fx[j] -= (ax / d) * f; fy[j] -= (ay / d) * f;
       }
@@ -870,7 +950,7 @@ class Viewer {
       const ax = pos[j].x - pos[i].x;
       const ay = pos[j].y - pos[i].y;
       const d = Math.hypot(ax, ay) || 0.01;
-      const f = (d - k) * SPRING_K;
+      const f = (d - k) * PHYSICS.SPRING_K;
       fx[i] += (ax / d) * f; fy[i] += (ay / d) * f;
       fx[j] -= (ax / d) * f; fy[j] -= (ay / d) * f;
     });
@@ -883,8 +963,8 @@ class Viewer {
       if (id === this.dragged) continue;   // kinematically pinned, not force-driven
 
       const v = this.velocity.get(id) || { vx: 0, vy: 0 };
-      let vx = (v.vx + fx[i]) * DAMPING;
-      let vy = (v.vy + fy[i]) * DAMPING;
+      let vx = (v.vx + fx[i]) * PHYSICS.DAMPING;
+      let vy = (v.vy + fy[i]) * PHYSICS.DAMPING;
       const speed = Math.hypot(vx, vy);
       if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
 
@@ -900,8 +980,8 @@ class Viewer {
     this.renderer.refresh();
     this.awakeFrames += 1;
 
-    const settled = (energy / nodes.length) < SLEEP_ENERGY;
-    if (this.dragged || (!settled && this.awakeFrames < MAX_AWAKE_FRAMES)) {
+    const settled = (energy / nodes.length) < PHYSICS.SLEEP_ENERGY;
+    if (this.dragged || (!settled && this.awakeFrames < PHYSICS.MAX_AWAKE_FRAMES)) {
       this.raf = requestAnimationFrame(() => this.physicsTick());
     } else {
       this.raf = null;

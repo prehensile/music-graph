@@ -44,12 +44,25 @@
     <p id="panel-profile">Tap or hover any node to see its details here.</p>
     <a id="panel-link" class="panel-link" target="_blank" rel="noopener noreferrer" hidden>View on Discogs ↗</a>
   </aside>
+
+  <aside id="physics-panel" hidden>
+    <div class="physics-panel-head">
+      <h2>Physics</h2>
+      <button id="physics-close" class="linkish" aria-label="Close">✕</button>
+    </div>
+    <div id="physics-controls"></div>
+    <div class="physics-panel-actions">
+      <button id="physics-reset" class="linkish">Reset</button>
+      <button id="physics-copy" class="linkish">Copy values</button>
+    </div>
+  </aside>
 </main>
 
 <footer>
   <ul id="legend"></ul>
   <span id="counts" class="muted"></span>
   <a href="/logs" class="linkish">Build log</a>
+  <button id="physics-toggle" class="linkish">Physics</button>
   <button id="reset" class="linkish">Clear</button>
 </footer>
 
