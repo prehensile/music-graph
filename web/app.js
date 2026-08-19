@@ -85,16 +85,23 @@ const DEFAULT_PHYSICS = {
   // 90 -> 160 once removing the layout's centring gravity entirely made
   // that same knotting visible again -- gravity's constant inward pull had
   // been partly masking under-strength repulsion by keeping everything
-  // nearer the centre rather than letting hubs actually spread apart.
-  REPULSE_K: 160,
+  // nearer the centre rather than letting hubs actually spread apart; and
+  // to 800, alongside SPRING_K down at its own floor, from hand-tuning in
+  // the physics panel once COLLISION_ITERATIONS existed to keep the result
+  // overlap-free regardless -- with springs barely resisting it, repulsion
+  // alone needs to be this strong to spread a knot out to begin with.
+  REPULSE_K: 800,
   // How close (in drawn-radius units) a pair's repulsion is allowed to
   // treat them as being, at minimum -- below this, the force stops
   // climbing toward infinity as d -> 0 and plateaus instead. 0 would let
-  // coincident nodes generate unbounded force; 1 is roughly their combined
-  // radii; 1.8 leaves a generous margin between two touching hubs.
-  SIZE_REPULSE_PAD: 1.8,
-  SPRING_K: 0.03,
-  DAMPING: 0.82,
+  // coincident nodes generate unbounded force. 1 (down from 1.8) means the
+  // force only plateaus once a pair reaches literal contact -- the same
+  // threshold the hard overlap-correction pass (see physicsTick) enforces
+  // as a floor anyway, so the two no longer disagree about how close is
+  // too close.
+  SIZE_REPULSE_PAD: 1,
+  SPRING_K: 0.005,
+  DAMPING: 0.8,
   // DAMPING above removes the same *fraction* of a node's velocity every
   // tick regardless of how fast it's moving, so it does nothing extra
   // against a burst of speed specifically -- and a dense knot repelling
