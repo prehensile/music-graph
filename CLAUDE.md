@@ -217,7 +217,9 @@ The call from `provision_droplet.sh` is deliberately tolerant (`|| echo ...`): b
 
 `Heartbeat` measures progress in whatever unit you give it — bytes consumed when streaming a file, rows when draining a query — so percentages stay accurate regardless of record count.
 
-**Recommended droplet: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run destroyed afterwards costs well under a pound.
+**Recommended droplet for the build: `s-4vcpu-8gb`** (8 GB / 4 vCPU / 160 GB SSD). Expect ~4–6 hours. DigitalOcean bills hourly and inbound bandwidth is free, so a one-off run destroyed afterwards costs well under a pound.
+
+**Steady-state serving needs much less than that.** Measured on a populated graph (15.2M nodes, 19.4M relationships): Neo4j's JVM sits around 1.5 GB RSS, the store itself is ~3.1 GB on disk, and load average on a single-user viewer is near zero. `s-2vcpu-4gb` is comfortable for serving once the import is done — see `notes/droplet-downsize-2026-08-19.md` for a worked migration (dump-and-load between droplets, not a resize, since DigitalOcean can grow a droplet's disk but never shrink it) including two gotchas worth knowing before repeating it: `neo4j-admin database load` only migrates the named database, never `system`, so the password needs setting independently on the new box before its first start; and running the load as root leaves the store root-owned, which the `neo4j` systemd user then can't open until `chown -R neo4j:neo4j` fixes it.
 
 Peak disk on the prefilter route, against the real 2026-08 dump sizes:
 
