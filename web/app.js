@@ -123,6 +123,19 @@ const DEFAULT_PHYSICS = {
   // (see beginNewGraph) rather than assuming a fixed frame.
   SLEEP_ENERGY: 0.0004,   // average per-node kinetic energy to go idle
   MAX_AWAKE_FRAMES: 900,  // ~15s at 60fps
+  // How many times the hard overlap-correction pass (see physicsTick)
+  // re-scans every pair per tick, not just once. A single pass resolves one
+  // pairwise overlap at a time and moves on -- fine for an isolated pair,
+  // but a node wedged between several overlapping neighbours (several
+  // leaves piled on one hub) gets shoved clear of one only to land back
+  // inside another, since each pair is corrected independently and the
+  // next pair's correction doesn't know about the one before it. Re-running
+  // the same pass against the results of the last one is a standard
+  // Gauss-Seidel relaxation: each iteration cleans up whatever the last one
+  // left inconsistent, so a pile converges in a handful of iterations
+  // within the one tick instead of leaking out over many frames (which is
+  // what read as both "still overlapping" and "unstable/slow to settle").
+  COLLISION_ITERATIONS: 4,
 };
 const PHYSICS = { ...DEFAULT_PHYSICS };
 
@@ -139,6 +152,7 @@ const PHYSICS_PARAMS = [
   { key: 'AREA_SIDE', label: 'Area side', min: 300, max: 2000, step: 20, decimals: 0 },
   { key: 'SLEEP_ENERGY', label: 'Sleep threshold', min: 0.0001, max: 0.005, step: 0.0001, decimals: 4 },
   { key: 'MAX_AWAKE_FRAMES', label: 'Max awake frames', min: 100, max: 3000, step: 50, decimals: 0 },
+  { key: 'COLLISION_ITERATIONS', label: 'Collision iterations', min: 1, max: 10, step: 1, decimals: 0 },
 ];
 
 // Keep in sync with styles.css's --bg -- the hover label's text is knocked
@@ -974,7 +988,10 @@ class Viewer {
     const maxSpeed = k * 0.6;
     const newX = new Float64Array(nodes.length);
     const newY = new Float64Array(nodes.length);
-    let energy = 0;
+    const preX = new Float64Array(nodes.length);  // pre-collision position, to recover the collision's own displacement below
+    const preY = new Float64Array(nodes.length);
+    const velX = new Float64Array(nodes.length);  // force-integrated velocity, before collision feedback
+    const velY = new Float64Array(nodes.length);
 
     for (let i = 0; i < nodes.length; i += 1) {
       const id = nodes[i];
@@ -997,73 +1014,94 @@ class Viewer {
       const speed = Math.hypot(vx, vy);
       if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
 
+      velX[i] = vx;
+      velY[i] = vy;
       newX[i] = pos[i].x + vx;
       newY[i] = pos[i].y + vy;
-      this.velocity.set(id, { vx, vy });
-      energy += vx * vx + vy * vy;
     }
+    preX.set(newX);
+    preY.set(newY);
 
     /*
      * Hard overlap correction -- a second, purely positional pass, separate
-     * from the force integration above. Repulsion only ever pushes nodes
-     * apart as a *force*; it settles wherever that force nets to ~0, which
-     * is not the same guarantee as "not overlapping", and two things above
-     * can each independently stall it short of that: maxSpeed caps every
-     * node's per-tick displacement at k*0.6 regardless of how much force is
-     * behind it, and DRIFT_FRICTION deliberately suppresses the exact kind
-     * of high per-tick speed a strong close-range shove produces (that's
-     * its job -- see DRIFT_FRICTION -- it just also fights this). Past
-     * whichever of those two saturates first, no amount of REPULSE_K does
-     * anything more per tick, so overlap can persist no matter how the
-     * spring/repulsion knobs are tuned. This pass sidesteps both: any pair
-     * still closer than the sum of their drawn radii gets shoved apart by
-     * exactly the overlap, split between them, independent of velocity --
-     * a plain Verlet-style contact solve, one relaxation step per tick
-     * (converging over a few frames) rather than iterating to convergence
-     * within a single one.
+     * from the force integration above and run to convergence rather than
+     * once. Repulsion only ever pushes nodes apart as a *force*; it settles
+     * wherever that force nets to ~0, which is not the same guarantee as
+     * "not overlapping", and two things above can each independently stall
+     * it short of that: maxSpeed caps every node's per-tick displacement at
+     * k*0.6 regardless of how much force is behind it, and DRIFT_FRICTION
+     * deliberately suppresses the exact kind of high per-tick speed a
+     * strong close-range shove produces (that's its job -- see
+     * DRIFT_FRICTION -- it just also fights this). Past whichever of those
+     * two saturates first, no amount of REPULSE_K does anything more per
+     * tick, so overlap can persist no matter how the spring/repulsion
+     * knobs are tuned.
      *
-     * `overlapping` keeps the sim awake while this is still doing work: the
-     * energy the sleep check below is built on comes only from the force
-     * pass, so a pair sitting deep inside each other's radii but past
-     * maxSpeed/DRIFT_FRICTION's reach could read as "settled" (near-zero
-     * velocity) while still visibly overlapping every frame.
+     * Each treats every node as a rigid, non-overlapping disc: any pair
+     * still closer than the sum of their drawn radii gets shoved apart by
+     * exactly the overlap, split between them, independent of velocity. A
+     * single sweep only ever resolves each pair in isolation, though -- a
+     * node wedged between several overlapping neighbours (several leaves
+     * piled on one hub) gets pushed clear of one only to land inside
+     * another, since each pair's correction has no idea about the next
+     * one's. COLLISION_ITERATIONS re-runs the sweep against the previous
+     * sweep's own output -- standard Gauss-Seidel relaxation -- so a whole
+     * pile converges within the one tick instead of leaking out a little
+     * per frame over many (which is what read as both persistent overlap
+     * and jittery, slow-to-settle motion).
      */
     let overlapping = false;
-    for (let i = 0; i < nodes.length; i += 1) {
-      for (let j = i + 1; j < nodes.length; j += 1) {
-        let ax = newX[i] - newX[j];
-        let ay = newY[i] - newY[j];
-        const minSep = pos[i].size + pos[j].size;
-        let d2 = ax * ax + ay * ay;
-        if (d2 >= minSep * minSep) continue;
-        overlapping = true;
-        if (d2 < 0.01) {          // coincident nodes need a nudge to separate
-          ax = Math.random() - 0.5;
-          ay = Math.random() - 0.5;
-          d2 = ax * ax + ay * ay || 0.01;
-        }
-        const d = Math.sqrt(d2);
-        const nx = ax / d;
-        const ny = ay / d;
-        const iPinned = nodes[i] === this.dragged;
-        const jPinned = nodes[j] === this.dragged;
-        // A pinned node doesn't move for this either -- the other one
-        // absorbs the full correction instead of the usual half each.
-        const push = minSep - d;
-        if (!iPinned) {
-          const share = jPinned ? push : push / 2;
-          newX[i] += nx * share; newY[i] += ny * share;
-        }
-        if (!jPinned) {
-          const share = iPinned ? push : push / 2;
-          newX[j] -= nx * share; newY[j] -= ny * share;
+    for (let iter = 0; iter < PHYSICS.COLLISION_ITERATIONS; iter += 1) {
+      let movedThisIter = false;
+      for (let i = 0; i < nodes.length; i += 1) {
+        for (let j = i + 1; j < nodes.length; j += 1) {
+          let ax = newX[i] - newX[j];
+          let ay = newY[i] - newY[j];
+          const minSep = pos[i].size + pos[j].size;
+          let d2 = ax * ax + ay * ay;
+          if (d2 >= minSep * minSep) continue;
+          overlapping = true;
+          movedThisIter = true;
+          if (d2 < 0.01) {          // coincident nodes need a nudge to separate
+            ax = Math.random() - 0.5;
+            ay = Math.random() - 0.5;
+            d2 = ax * ax + ay * ay || 0.01;
+          }
+          const d = Math.sqrt(d2);
+          const nx = ax / d;
+          const ny = ay / d;
+          const iPinned = nodes[i] === this.dragged;
+          const jPinned = nodes[j] === this.dragged;
+          // A pinned node doesn't move for this either -- the other one
+          // absorbs the full correction instead of the usual half each.
+          const push = minSep - d;
+          if (!iPinned) {
+            const share = jPinned ? push : push / 2;
+            newX[i] += nx * share; newY[i] += ny * share;
+          }
+          if (!jPinned) {
+            const share = iPinned ? push : push / 2;
+            newX[j] -= nx * share; newY[j] -= ny * share;
+          }
         }
       }
+      if (!movedThisIter) break;   // already fully separated -- no need to spend the remaining iterations
     }
 
+    // Fold the collision pass's own displacement back into velocity, rather
+    // than only teleporting position -- otherwise next tick's force
+    // integration starts from a velocity that no longer matches where the
+    // node actually is, which is exactly what reads as jitter (a corrected
+    // node "forgets" it was just shoved and immediately drifts back
+    // in-frame under old momentum).
+    let energy = 0;
     for (let i = 0; i < nodes.length; i += 1) {
       const id = nodes[i];
       if (id === this.dragged) continue;   // kinematically pinned, not force-driven
+      const vx = velX[i] + (newX[i] - preX[i]);
+      const vy = velY[i] + (newY[i] - preY[i]);
+      this.velocity.set(id, { vx, vy });
+      energy += vx * vx + vy * vy;
       g.setNodeAttribute(id, 'x', newX[i]);
       g.setNodeAttribute(id, 'y', newY[i]);
     }
