@@ -85,19 +85,17 @@ const REPULSE_K = 90;
 const SIZE_REPULSE_PAD = 1.8;
 const SPRING_K = 0.03;
 const DAMPING = 0.82;
-// Gravity only kicks in past GRAVITY_RADIUS from the origin -- a dead zone,
-// not a pull felt everywhere. Applying it to every node's raw position (the
-// old behaviour) makes it a harmonic trap: pointed at a fixed centre and
-// isotropic, same as repulsion, so together they have exactly one
-// equilibrium shape -- a uniform disc -- and every node relaxes toward it
-// regardless of the graph's actual edges, most visibly once enough taps/
-// searches have piled on weakly-connected leaves for that equilibrium to
-// win out over their one spring each. Confining only stragglers that
-// wander past the dead zone keeps the original job (stop a disconnected
-// component drifting off to infinity) without also sculpting everything
-// inside it into a circle.
-const GRAVITY = 0.02;
-const GRAVITY_RADIUS = AREA_SIDE;
+// No centring gravity at all -- there used to be one (first a pull felt at
+// every radius, then narrowed to a dead-zone wall past GRAVITY_RADIUS), and
+// both versions still visibly rounded the graph off into a circle over
+// time. Any force pointed at a fixed origin is isotropic in the same way
+// repulsion is, so the two together always have a single equilibrium shape
+// -- a disc -- regardless of the graph's actual edges; narrowing where it
+// kicked in just shrank the effect, it didn't remove it. Without it a
+// component that repulsion pushes away from the rest just drifts until
+// repulsion is too weak to matter and damping settles it there -- fine,
+// since sigma auto-fits the camera to whatever the bounding box ends up
+// being (see beginNewGraph) rather than assuming a fixed frame.
 const SLEEP_ENERGY = 0.0004;   // average per-node kinetic energy to go idle
 const MAX_AWAKE_FRAMES = 900;  // ~15s at 60fps
 
@@ -887,16 +885,8 @@ class Viewer {
       const speed = Math.hypot(vx, vy);
       if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
 
-      let x = pos[i].x + vx;
-      let y = pos[i].y + vy;
-      // Soft containment wall, not a pull toward the centre from everywhere
-      // -- see GRAVITY_RADIUS.
-      const r = Math.hypot(x, y);
-      if (r > GRAVITY_RADIUS) {
-        const pull = (r - GRAVITY_RADIUS) * GRAVITY;
-        x -= (x / r) * pull;
-        y -= (y / r) * pull;
-      }
+      const x = pos[i].x + vx;
+      const y = pos[i].y + vy;
 
       g.setNodeAttribute(id, 'x', x);
       g.setNodeAttribute(id, 'y', y);
