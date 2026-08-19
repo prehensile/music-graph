@@ -76,7 +76,7 @@ const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
 // Opacity multiplier for nodes/edges on screen that aren't directly
 // connected to whichever node is currently hovered -- see reduceNode/reduceEdge.
-const FADE_ALPHA = 0.5;
+const FADE_ALPHA = 0.2;
 // Edges have no per-edge colour of their own (see the addEdge call in
 // merge()), so unlike nodes there's no stored value for reduceEdge to fade --
 // these two are it, EDGE_COLOR_FADED being EDGE_COLOR's alpha scaled by
