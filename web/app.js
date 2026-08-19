@@ -95,6 +95,21 @@ const DEFAULT_PHYSICS = {
   SIZE_REPULSE_PAD: 1.8,
   SPRING_K: 0.03,
   DAMPING: 0.82,
+  // DAMPING above removes the same *fraction* of a node's velocity every
+  // tick regardless of how fast it's moving, so it does nothing extra
+  // against a burst of speed specifically -- and a dense knot repelling
+  // another dense knot produces exactly that: every node in one knot
+  // pushes every node in the other (an O(n_a * n_b) sum, not one knot-vs-
+  // knot force), so two knots drift apart under a much larger net force
+  // than any single spring is pulling back with, and DAMPING alone barely
+  // slows that down. DRIFT_FRICTION is a second, speed-scaled drag applied
+  // on top: `1 / (1 + DRIFT_FRICTION * speed)` shrinks velocity by more
+  // the faster a node is already moving, so it bites hard on that
+  // aggregate-repulsion drift while barely touching the slow jostling
+  // nodes do while settling into a knot -- unlike raising DAMPING, which
+  // would slow both equally and make knots even slower to spread
+  // internally.
+  DRIFT_FRICTION: 0.03,
   // No centring gravity at all -- there used to be one (first a pull felt
   // at every radius, then narrowed to a dead-zone wall), and both versions
   // still visibly rounded the graph off into a circle over time. Any force
@@ -120,6 +135,7 @@ const PHYSICS_PARAMS = [
   { key: 'SIZE_REPULSE_PAD', label: 'Repulsion floor', min: 1, max: 3, step: 0.05, decimals: 2 },
   { key: 'SPRING_K', label: 'Spring strength', min: 0.005, max: 0.15, step: 0.005, decimals: 3 },
   { key: 'DAMPING', label: 'Damping', min: 0.5, max: 0.95, step: 0.01, decimals: 2 },
+  { key: 'DRIFT_FRICTION', label: 'Drift friction', min: 0, max: 0.2, step: 0.005, decimals: 3 },
   { key: 'AREA_SIDE', label: 'Area side', min: 300, max: 2000, step: 20, decimals: 0 },
   { key: 'SLEEP_ENERGY', label: 'Sleep threshold', min: 0.0001, max: 0.005, step: 0.0001, decimals: 4 },
   { key: 'MAX_AWAKE_FRAMES', label: 'Max awake frames', min: 100, max: 3000, step: 50, decimals: 0 },
@@ -965,6 +981,17 @@ class Viewer {
       const v = this.velocity.get(id) || { vx: 0, vy: 0 };
       let vx = (v.vx + fx[i]) * PHYSICS.DAMPING;
       let vy = (v.vy + fy[i]) * PHYSICS.DAMPING;
+
+      // Speed-scaled drag, on top of DAMPING's flat per-tick loss -- see
+      // DRIFT_FRICTION. Applied before the maxSpeed clamp below so it acts
+      // on the node's actual velocity, not the clamped one.
+      const rawSpeed = Math.hypot(vx, vy);
+      if (rawSpeed > 0 && PHYSICS.DRIFT_FRICTION > 0) {
+        const drag = 1 / (1 + PHYSICS.DRIFT_FRICTION * rawSpeed);
+        vx *= drag;
+        vy *= drag;
+      }
+
       const speed = Math.hypot(vx, vy);
       if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
 
