@@ -78,12 +78,11 @@ const OUTLINE_COLOR = '#ffffff';
 // connected to whichever node is currently hovered -- see reduceNode/reduceEdge.
 const FADE_ALPHA = 0.2;
 // Edges have no per-edge colour of their own (see the addEdge call in
-// merge()), so unlike nodes there's no stored value for reduceEdge to fade --
-// these two are it, EDGE_COLOR_FADED being EDGE_COLOR's alpha scaled by
-// FADE_ALPHA.
+// merge()) -- EDGE_RGB/EDGE_ALPHA are the base grey both the default and the
+// faded variant (EDGE_COLOR/EDGE_COLOR_FADED, built below once
+// rgbaPremultiplied exists) are derived from.
+const EDGE_RGB = [148, 163, 184];
 const EDGE_ALPHA = 0.35;
-const EDGE_COLOR = `rgba(148,163,184,${EDGE_ALPHA})`;
-const EDGE_COLOR_FADED = `rgba(148,163,184,${EDGE_ALPHA * FADE_ALPHA})`;
 
 // Node size grows fast with degree up to about SIZE_KNEE connections, then
 // flattens -- a hub with hundreds of connections should not dwarf everything
@@ -97,12 +96,30 @@ const SIZE_SCALE = 0.9 * (SIZE_MAX - SIZE_MIN) / Math.log2(SIZE_KNEE + 1);
 
 const $ = (id) => document.getElementById(id);
 
-// '#rrggbb' -> 'rgba(r,g,b,alpha)', for fading a node's fill/border colour at
-// render time (see reduceNode) without touching its stored `color` attribute.
+// Sigma's WebGL contexts are all set up with gl.blendFunc(gl.ONE,
+// gl.ONE_MINUS_SRC_ALPHA) -- standard premultiplied-alpha compositing -- but
+// the node/edge/border shaders write out gl_FragColor as plain, un-multiplied
+// colour. Fed a colour at less than full alpha, that combination adds the
+// *full-brightness* colour on top of only (1 - alpha) of the background,
+// rather than fading it toward the background: against this app's near-black
+// bg that overshoot reads as barely-dimmed-at-all, which is exactly the "no
+// brightness change" symptom. Baking the alpha into r/g/b ourselves --
+// producing genuinely premultiplied output -- is what the blend func was
+// actually expecting, and makes alpha behave as alpha.
+function rgbaPremultiplied(r, g, b, alpha) {
+  return `rgba(${Math.round(r * alpha)},${Math.round(g * alpha)},${Math.round(b * alpha)},${alpha})`;
+}
+
+// '#rrggbb' -> premultiplied rgba(), for fading a node's fill/border colour
+// at render time (see reduceNode) without touching its stored `color`
+// attribute.
 function withAlpha(hex, alpha) {
   const n = parseInt(hex.slice(1), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+  return rgbaPremultiplied((n >> 16) & 255, (n >> 8) & 255, n & 255, alpha);
 }
+
+const EDGE_COLOR = rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA);
+const EDGE_COLOR_FADED = rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA * FADE_ALPHA);
 
 /*
  * Custom hover-label renderer, wired in via the `defaultDrawNodeHover`
