@@ -500,7 +500,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if not self._authorised():
             self.send_response(HTTPStatus.UNAUTHORIZED)
-            self.send_header("WWW-Authenticate", 'Basic realm="music-graph"')
+            self.send_header("WWW-Authenticate", 'Basic realm="discograph"')
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

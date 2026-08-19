@@ -1,5 +1,5 @@
 /*
- * Music Graph viewer.
+ * Discograph viewer.
  *
  * Talks only to this server's own JSON API -- no database credentials reach the
  * page and no Cypher is built here. Layout is a damped mass-spring simulation
@@ -72,7 +72,7 @@ const MAX_AWAKE_FRAMES = 900;  // ~15s at 60fps
 const PAGE_BG = '#0b1120';
 // The white node rim's width/colour -- consumed by the border node program
 // built in initRenderer, not a canvas stroke.
-const OUTLINE_WIDTH = 1.5;
+const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
 
 // Node size grows fast with degree up to about SIZE_KNEE connections, then
@@ -534,7 +534,7 @@ class Viewer {
       if (!this.graph.hasNode(e.source) || !this.graph.hasNode(e.target)) return;
       if (e.source === e.target) return;
       if (this.graph.hasEdge(e.source, e.target)) return;
-      this.graph.addEdge(e.source, e.target, { type_: e.type, size: 1 });
+      this.graph.addEdge(e.source, e.target, { type_: e.type, size: 2 });
     });
 
     // Size reflects connections actually visible in the accumulated graph --
@@ -724,6 +724,20 @@ class Viewer {
     const rows = [];
     if (a.realname) rows.push(['Real name', a.realname]);
     if (a.year) rows.push(['Year', a.year]);
+    // A Release has no artist of its own in the graph schema -- credit lives
+    // one CREDITED hop away, on the Artist/Group node(s) attached to it. Only
+    // whatever's already in the client-side graph is available here, same as
+    // every other row below, so this is empty until that neighbour has been
+    // fetched in (which search/expand do by default via the two-hop fetch).
+    if (a.kind === 'Release') {
+      const artists = [];
+      this.graph.forEachEdge(nodeId, (_e, attrs, source, target, sourceAttrs, targetAttrs) => {
+        if (attrs.type_ !== 'CREDITED') return;
+        const other = source === nodeId ? targetAttrs : sourceAttrs;
+        if (other && other.title) artists.push(other.title);
+      });
+      if (artists.length) rows.push(['Artist', artists.join(', ')]);
+    }
     rows.push(['Shown connections', String(neighbours)]);
 
     const byType = {};

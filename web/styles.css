@@ -47,14 +47,17 @@ h1 {
 #search-form {
   display: flex;
   gap: 8px;
-  flex: 1 1 420px;
+  /* h1 doesn't grow, so this is the only item absorbing header width beyond
+     its own basis -- raised from 420px so it asserts more room up front
+     rather than relying on leftover space to stretch into. */
+  flex: 1 1 640px;
   min-width: 0;
 }
 
 input[type="search"] {
   flex: 1;
   min-width: 0;
-  padding: 10px 12px;
+  padding: 11px 14px;
   font-size: 16px; /* 16px stops iOS zooming the page on focus */
   color: var(--text);
   background: #0d1526;
