@@ -74,9 +74,16 @@ const PAGE_BG = '#0b1120';
 // built in initRenderer, not a canvas stroke.
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
-// Opacity for nodes on screen that aren't directly connected to whichever
-// node is currently hovered -- see reduceNode.
+// Opacity multiplier for nodes/edges on screen that aren't directly
+// connected to whichever node is currently hovered -- see reduceNode/reduceEdge.
 const FADE_ALPHA = 0.5;
+// Edges have no per-edge colour of their own (see the addEdge call in
+// merge()), so unlike nodes there's no stored value for reduceEdge to fade --
+// these two are it, EDGE_COLOR_FADED being EDGE_COLOR's alpha scaled by
+// FADE_ALPHA.
+const EDGE_ALPHA = 0.35;
+const EDGE_COLOR = `rgba(148,163,184,${EDGE_ALPHA})`;
+const EDGE_COLOR_FADED = `rgba(148,163,184,${EDGE_ALPHA * FADE_ALPHA})`;
 
 // Node size grows fast with degree up to about SIZE_KNEE connections, then
 // flattens -- a hub with hundreds of connections should not dwarf everything
@@ -201,7 +208,7 @@ class Viewer {
     this.renderer = new Sigma(this.graph, $('graph'), {
       renderEdgeLabels: false,
       defaultNodeColor: COLOURS.Unknown,
-      defaultEdgeColor: 'rgba(148,163,184,0.35)',
+      defaultEdgeColor: EDGE_COLOR,
       labelColor: { color: '#e2e8f0' },
       labelSize: 12,
       labelWeight: '500',
@@ -223,6 +230,7 @@ class Viewer {
       // attribute (which the legend, panel etc. all still read at full
       // strength). See enterNode/leaveNode for what drives it.
       nodeReducer: (node, data) => this.reduceNode(node, data),
+      edgeReducer: (edge, data) => this.reduceEdge(edge, data),
     });
 
     // The info panel is a constant fixture, not a popup -- it always shows
@@ -752,6 +760,18 @@ class Viewer {
       return data;
     }
     return { ...data, color: withAlpha(data.color, FADE_ALPHA), borderColor: withAlpha(OUTLINE_COLOR, FADE_ALPHA) };
+  }
+
+  /*
+   * edgeReducer counterpart to reduceNode: while a node is hovered, every
+   * edge not touching it fades to EDGE_COLOR_FADED; edges into/out of the
+   * hovered node are left alone.
+   */
+  reduceEdge(edge, data) {
+    if (!this.hoveredNode) return data;
+    const [source, target] = this.graph.extremities(edge);
+    if (source === this.hoveredNode || target === this.hoveredNode) return data;
+    return { ...data, color: EDGE_COLOR_FADED };
   }
 
   /*
