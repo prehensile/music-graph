@@ -131,7 +131,7 @@ const PHYSICS = { ...DEFAULT_PHYSICS };
 // range/step, and how many decimals are worth showing. Order here is
 // display order.
 const PHYSICS_PARAMS = [
-  { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 400, step: 5, decimals: 0 },
+  { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 800, step: 5, decimals: 0 },
   { key: 'SIZE_REPULSE_PAD', label: 'Repulsion floor', min: 1, max: 3, step: 0.05, decimals: 2 },
   { key: 'SPRING_K', label: 'Spring strength', min: 0.005, max: 0.15, step: 0.005, decimals: 3 },
   { key: 'DAMPING', label: 'Damping', min: 0.5, max: 0.95, step: 0.01, decimals: 2 },
