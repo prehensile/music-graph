@@ -85,7 +85,19 @@ const REPULSE_K = 90;
 const SIZE_REPULSE_PAD = 1.8;
 const SPRING_K = 0.03;
 const DAMPING = 0.82;
-const GRAVITY = 0.008;
+// Gravity only kicks in past GRAVITY_RADIUS from the origin -- a dead zone,
+// not a pull felt everywhere. Applying it to every node's raw position (the
+// old behaviour) makes it a harmonic trap: pointed at a fixed centre and
+// isotropic, same as repulsion, so together they have exactly one
+// equilibrium shape -- a uniform disc -- and every node relaxes toward it
+// regardless of the graph's actual edges, most visibly once enough taps/
+// searches have piled on weakly-connected leaves for that equilibrium to
+// win out over their one spring each. Confining only stragglers that
+// wander past the dead zone keeps the original job (stop a disconnected
+// component drifting off to infinity) without also sculpting everything
+// inside it into a circle.
+const GRAVITY = 0.02;
+const GRAVITY_RADIUS = AREA_SIDE;
 const SLEEP_ENERGY = 0.0004;   // average per-node kinetic energy to go idle
 const MAX_AWAKE_FRAMES = 900;  // ~15s at 60fps
 
@@ -270,6 +282,11 @@ class Viewer {
     // exempt while that transition was still playing.
     this.hoveredNode = null;
     this.hoveredNeighbours = null;
+    // Set instead of hoveredNode while a legend key is rolled over -- see
+    // initLegend. reduceNode/reduceEdge treat every node of this kind as
+    // exempt from the fade, same roll-out-survives-until-fadeCurrent-is-0
+    // rule as hoveredNode above.
+    this.highlightKind = null;
     this.fadeCurrent = 0;
     this.fadeTarget = 0;
     this.fadeRaf = null;
@@ -448,11 +465,30 @@ class Viewer {
     });
   }
 
+  // Rolling over a key reuses enterNode/leaveNode's own fade tween (see
+  // reduceNode/reduceEdge) rather than a separate effect: it just drives
+  // highlightKind instead of hoveredNode, so every node of that kind is
+  // exempt from the fade in place of a single node and its neighbours.
   initLegend() {
     $('legend').innerHTML = Object.keys(COLOURS)
       .filter((k) => k !== 'Unknown')
-      .map((k) => `<li><i style="background:${COLOURS[k]}"></i>${k}</li>`)
+      .map((k) => `<li data-kind="${k}"><i style="background:${COLOURS[k]}"></i>${k}</li>`)
       .join('');
+    $('legend').querySelectorAll('li').forEach((li) => {
+      const kind = li.dataset.kind;
+      li.addEventListener('mouseenter', () => {
+        this.highlightKind = kind;
+        this.fadeTarget = FADE_MIX;
+        this.animateFade();
+      });
+      li.addEventListener('mouseleave', () => {
+        // highlightKind itself stays set until fadeCurrent actually reaches
+        // 0 -- see animateFade -- so the key's own nodes don't jump back to
+        // "faded" mid roll-out.
+        this.fadeTarget = 0;
+        this.animateFade();
+      });
+    });
   }
 
   bindEvents() {
@@ -551,6 +587,7 @@ class Viewer {
     if (this.fadeRaf) { cancelAnimationFrame(this.fadeRaf); this.fadeRaf = null; }
     this.hoveredNode = null;
     this.hoveredNeighbours = null;
+    this.highlightKind = null;
     this.fadeCurrent = 0;
     this.fadeTarget = 0;
     this.setHighlight(null);
@@ -842,8 +879,14 @@ class Viewer {
 
       let x = pos[i].x + vx;
       let y = pos[i].y + vy;
-      x -= x * GRAVITY;            // weak gravity keeps components in frame
-      y -= y * GRAVITY;
+      // Soft containment wall, not a pull toward the centre from everywhere
+      // -- see GRAVITY_RADIUS.
+      const r = Math.hypot(x, y);
+      if (r > GRAVITY_RADIUS) {
+        const pull = (r - GRAVITY_RADIUS) * GRAVITY;
+        x -= (x / r) * pull;
+        y -= (y / r) * pull;
+      }
 
       g.setNodeAttribute(id, 'x', x);
       g.setNodeAttribute(id, 'y', y);
@@ -944,6 +987,7 @@ class Viewer {
         if (this.fadeTarget === 0) {
           this.hoveredNode = null;
           this.hoveredNeighbours = null;
+          this.highlightKind = null;
         }
         this.renderer.refresh();
         return;
@@ -1006,10 +1050,11 @@ class Viewer {
    * nodeReducer, doing two unrelated things at once (both cheap, so one pass
    * covers both rather than composing two reducers):
    *
-   * 1. Tweens every on-screen node that isn't the hovered node itself or one
-   *    of its direct neighbours toward the background colour, at whatever
-   *    point animateFade's transition currently is (see FADE_MIX for why
-   *    colour, not alpha).
+   * 1. Tweens every on-screen node that isn't exempt (the hovered node and
+   *    its direct neighbours, or every node of the rolled-over legend key's
+   *    kind -- see the `exempt` check below) toward the background colour,
+   *    at whatever point animateFade's transition currently is (see
+   *    FADE_MIX for why colour, not alpha).
    * 2. Hides the WebGL border ring on an incomplete node (`!data.expanded`,
    *    see merge()) by colouring it to match the fill, and stashes what the
    *    ring *would* be in `ringColor` for drawIncompleteRings to read back
@@ -1024,7 +1069,13 @@ class Viewer {
    * them (legend, panel, drawIncompleteRings) needs to know about this.
    */
   reduceNode(node, data) {
-    const faded = this.fadeCurrent > 0 && node !== this.hoveredNode && !this.hoveredNeighbours?.has(node);
+    // Exempt from the fade: the hovered node and its direct neighbours
+    // normally, or -- while a legend key is rolled over (see initLegend) --
+    // every node of that key's kind instead.
+    const exempt = this.highlightKind
+      ? data.kind === this.highlightKind
+      : node === this.hoveredNode || this.hoveredNeighbours?.has(node);
+    const faded = this.fadeCurrent > 0 && !exempt;
     const incomplete = !data.expanded;
     if (!faded && !incomplete) return data;
 
@@ -1046,6 +1097,11 @@ class Viewer {
   reduceEdge(edge, data) {
     if (this.fadeCurrent <= 0) return data;
     const [source, target] = this.graph.extremities(edge);
+    if (this.highlightKind) {
+      const exempt = this.graph.getNodeAttribute(source, 'kind') === this.highlightKind
+        || this.graph.getNodeAttribute(target, 'kind') === this.highlightKind;
+      return exempt ? data : { ...data, color: edgeColorAt(this.fadeCurrent) };
+    }
     if (source === this.hoveredNode || target === this.hoveredNode) return data;
     return { ...data, color: edgeColorAt(this.fadeCurrent) };
   }
