@@ -75,9 +75,17 @@ const PAGE_BG = '#0b1120';
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
 const LABEL_COLOR = '#e2e8f0';
-// Dash/gap lengths (px) for an incomplete node's ring -- see
-// drawIncompleteRings and the `expanded` node attribute (merge()).
-const INCOMPLETE_RING_DASH = [4, 3];
+// An incomplete node's ring is dashed with this many dashes all the way
+// round, regardless of the node's on-screen radius -- see drawIncompleteRings
+// and the `expanded` node attribute (merge()). A fixed pixel dash length
+// looked fine at typical sizes but fell apart zoomed out: a small node's
+// much shorter circumference fit only a handful of dashes, chunky and
+// sparse rather than a dashed ring. Scaling dash length off the radius
+// instead keeps the count constant so it still reads as "dashed" at any size.
+const INCOMPLETE_RING_DASH_COUNT = 12;
+// Fraction of each dash+gap period that's dash rather than gap -- 4/7 is
+// the old fixed [4, 3] pattern's own ratio, kept for the same look.
+const INCOMPLETE_RING_DASH_RATIO = 4 / 7;
 // How far nodes/labels/edges on screen that aren't directly connected to
 // whichever node is currently hovered tween toward PAGE_BG -- see
 // reduceNode/reduceEdge/lerpToBg. 0 = untouched, 1 = fully the background
@@ -910,7 +918,6 @@ class Viewer {
     const { width, height } = this.renderer.getDimensions();
     ctx.clearRect(0, 0, width, height);
     ctx.lineWidth = OUTLINE_WIDTH;
-    ctx.setLineDash(INCOMPLETE_RING_DASH);
     this.graph.forEachNode((node, attrs) => {
       if (attrs.expanded) return;
       const display = this.renderer.getNodeDisplayData(node);
@@ -920,6 +927,16 @@ class Viewer {
       // its path by canvas convention) spans the same annulus the WebGL
       // ring would have -- see reduceNode's `size` -> outer-edge relationship.
       const r = this.renderer.scaleSize(display.size) - OUTLINE_WIDTH / 2;
+      // canvas arc() throws on a negative radius -- reachable zoomed far
+      // enough out that a small node's scaled size shrinks past the
+      // border inset. Nothing meaningful to draw at that point anyway.
+      if (r <= 0) return;
+      // Dash length off this node's own circumference (see
+      // INCOMPLETE_RING_DASH_COUNT) rather than a fixed pixel length, so a
+      // tiny zoomed-out node still reads as dashed instead of a handful of
+      // chunky marks.
+      const period = (2 * Math.PI * r) / INCOMPLETE_RING_DASH_COUNT;
+      ctx.setLineDash([period * INCOMPLETE_RING_DASH_RATIO, period * (1 - INCOMPLETE_RING_DASH_RATIO)]);
       ctx.strokeStyle = display.ringColor || OUTLINE_COLOR;
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
