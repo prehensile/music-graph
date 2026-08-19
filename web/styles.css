@@ -47,7 +47,7 @@ h1 {
 #search-form {
   display: flex;
   gap: 8px;
-  flex: 1 1 240px;
+  flex: 1 1 420px;
   min-width: 0;
 }
 
@@ -335,4 +335,7 @@ footer a.linkish { text-decoration: underline; }
   h1 { font-size: 15px; }
   #counts { display: none; }
   #panel { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; max-height: 52%; }
+  /* Claim the full row on its own rather than sharing one with h1 -- the
+     420px flex-basis above is a desktop hint, not a phone-width one. */
+  #search-form { flex-basis: 100%; }
 }

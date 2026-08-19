@@ -1,7 +1,11 @@
 # Search relevance: releases don't rank against their own artist, 2026-08-19
 
-Filed while adding live search (`/api/suggest`). Not fixed yet — this is the
-diagnosis and a menu of fixes, ranked cheapest first, for whoever picks it up.
+Filed while adding live search (`/api/suggest`). This is the diagnosis and a
+menu of fixes, ranked cheapest first.
+
+**Update, same day:** Option B is implemented — `Graph._rank_matches` in
+`server.py`, used by both `search` and `suggest`. Option A (denormalize +
+reindex) is still open if B's ceiling turns out too low in practice.
 
 ## The bug, concretely
 

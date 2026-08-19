@@ -83,16 +83,36 @@ def clamp_limit(raw, default=60):
         return default
 
 
-# Separate, smaller cap from MAX_LIMIT: a live-typing dropdown wants a handful
-# of top matches, not the couple hundred nodes a committed search expands to.
-SUGGEST_LIMIT_MAX = 15
+# Separate, smaller cap from MAX_LIMIT: a live-typing dropdown wants a
+# generous handful of top matches, not the couple hundred nodes a committed
+# search expands to.
+SUGGEST_LIMIT_MAX = 20
 
 
-def clamp_suggest_limit(raw, default=8):
+def clamp_suggest_limit(raw, default=10):
     try:
         return max(1, min(SUGGEST_LIMIT_MAX, int(raw)))
     except (TypeError, ValueError):
         return default
+
+
+# _rank_matches (see below) always fetches this many candidates from the
+# full-text index, regardless of how few it will actually return -- fixed
+# rather than scaled by the caller's `limit`, so a match sitting well down
+# the plain full-text ranking still has a fair pool to be promoted from by
+# the neighbour-term boost. A real query has shown a correct match sitting
+# ~40 places down the raw full-text order (see
+# notes/search-relevance-2026-08-19.md), which is why these aren't small.
+SEARCH_POOL_MAX = 60
+SUGGEST_POOL_MAX = 60
+
+# Added to a candidate's Lucene score per query term that its own name/title
+# is missing but a directly-connected artist or label carries instead.
+# Measured Lucene scores here run roughly 5-8 for a short exact-text match
+# (see notes/search-relevance-2026-08-19.md), so this is sized to outweigh
+# that gap -- a genuine cross-relationship match should win outright, not
+# nudge ahead by a fraction.
+NEIGHBOUR_TERM_BOOST = 6.0
 
 
 def tail_lines(path, max_bytes=LOG_TAIL_BYTES, max_lines=LOG_TAIL_LINES):
@@ -201,17 +221,9 @@ class Graph:
         term = clean_term(term)
         if not term:
             return {"nodes": [], "edges": []}
-        # Seeds come from the full-text index; a CONTAINS scan over millions of
-        # nodes would not return in reasonable time.
-        seed_rows = self._run(
-            """
-            CALL db.index.fulltext.queryNodes($index, $term, {limit: $seeds})
-            YIELD node AS n
-            RETURN elementId(n) AS id
-            """,
-            index=SEARCH_INDEX, term=term, seeds=max(1, limit // 4),
-        )
-        return self._expand_two_hop([r["id"] for r in seed_rows], limit)
+        seeds = max(1, limit // 4)
+        matches = self._rank_matches(term, seeds, SEARCH_POOL_MAX)
+        return self._expand_two_hop([m["id"] for m in matches], limit)
 
     def suggest(self, term, limit):
         """
@@ -226,9 +238,37 @@ class Graph:
         term = clean_term(term)
         if not term:
             return {"results": []}
+        matches = self._rank_matches(term, limit, SUGGEST_POOL_MAX)
+        # `score` only exists to rank matches against each other; the client
+        # has no use for it.
+        return {"results": [{k: v for k, v in m.items() if k != "score"} for m in matches]}
+
+    def _rank_matches(self, term, limit, pool):
+        """
+        Full-text matches for `term`, re-scored by a query-time approximation
+        of denormalizing credited-artist/label text onto the node -- see
+        notes/search-relevance-2026-08-19.md (Option B there). `entitySearch`
+        indexes each node's own name/title in isolation, so a Release titled
+        just "Timeless" can never outscore an unrelated release literally
+        titled "Goldie" for the query "goldie timeless", even though the
+        first is exactly what searching both words together means: the word
+        "Goldie" lives on the *artist* node, one CREDITED hop away, and
+        Lucene has no way to see across it.
+
+        Fixing that properly (Option A in the note) means denormalizing that
+        text onto Release itself and widening the index -- a live reindex
+        over millions of nodes, or a pipeline change plus a full rebuild.
+        This is the cheap stand-in: fetch a wider pool of candidates than
+        `limit` asks for, and for each one still missing a query term in its
+        own text, check whether a directly CREDITED artist or RELEASED_ON
+        label carries it instead -- the same neighbour data `suggest` already
+        wants for its descriptive text, so this costs one extra hop per
+        candidate rather than a second round trip.
+        """
+        terms = [t for t in term.lower().split() if t]
         rows = self._run(
             """
-            CALL db.index.fulltext.queryNodes($index, $term, {limit: $limit})
+            CALL db.index.fulltext.queryNodes($index, $term, {limit: $pool})
             YIELD node, score
             OPTIONAL MATCH (node)<-[:CREDITED]-(artist)
             OPTIONAL MATCH (node)-[:RELEASED_ON]->(label)
@@ -239,24 +279,34 @@ class Graph:
                    coalesce(node.name, node.title) AS title,
                    node.year AS year,
                    left(coalesce(node.profile, ''), 200) AS profile,
-                   artists, labelNames
-            ORDER BY score DESC
+                   score, artists, labelNames
             """,
-            index=SEARCH_INDEX, term=term, limit=limit,
+            index=SEARCH_INDEX, term=term, pool=pool,
         )
-        results = []
+        matches = []
         for r in rows:
             kind = next((l for l in (r["nodeLabels"] or []) if l in NODE_LABELS), "Unknown")
-            results.append({
+            title = r["title"] or "(untitled)"
+            artists = [a for a in (r["artists"] or []) if a]
+            labels = [l for l in (r["labelNames"] or []) if l]
+            own_text = title.lower()
+            neighbour_names = [n.lower() for n in artists + labels]
+            boost = sum(
+                NEIGHBOUR_TERM_BOOST for t in terms
+                if t not in own_text and any(t in n for n in neighbour_names)
+            )
+            matches.append({
                 "id": r["id"],
                 "kind": kind,
-                "title": r["title"] or "(untitled)",
+                "title": title,
                 "year": r["year"] or "",
                 "profile": r["profile"] or "",
-                "artists": [a for a in (r["artists"] or []) if a],
-                "labels": [l for l in (r["labelNames"] or []) if l],
+                "artists": artists,
+                "labels": labels,
+                "score": (r["score"] or 0.0) + boost,
             })
-        return {"results": results}
+        matches.sort(key=lambda m: m["score"], reverse=True)
+        return matches[:limit]
 
     def expand(self, element_id, limit):
         return self._expand_two_hop([element_id], limit)
