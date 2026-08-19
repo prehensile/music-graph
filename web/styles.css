@@ -26,19 +26,17 @@ body {
 
 /* ------------------------------------------------------------------ header */
 
-/* Rebuilt as a stack, title above search, rather than a row the two share --
-   two rounds of "make the shared row split differently" (flex-basis, then
-   grid) both left the search box unchanged, despite the served CSS
-   checking out correct each time. A stacked layout sidesteps that question
-   entirely: #search-form is the only thing on its row, so it's full width
-   by construction, not by however a division of one row against h1 works
-   out. Same at every viewport width, so the old mobile-only override
-   (header's grid-template-columns collapsing to 1fr under 560px) is gone
-   too -- nothing left for it to do. */
+/* Back to one row -- title, search, button -- now that the actual bug (see
+   input[type="search"] below) is fixed rather than papered over: the stacked
+   layout from the last attempt never needed to exist, it just happened to
+   dodge a rendering symptom without fixing its cause. `auto minmax(0, 1fr)`
+   gives the search form everything left over after h1's own width, full
+   stop -- no flex-grow ambiguity to get wrong a second time. */
 header {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
   padding: 10px 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--edge);
@@ -49,16 +47,23 @@ h1 {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 0.3px;
+  white-space: nowrap;
 }
 
 #search-form {
   display: flex;
   gap: 8px;
-  width: 100%;
+  min-width: 0;
 }
 
 input[type="search"] {
-  flex: 1;
+  /* Not a flex item -- its actual parent is .search-box, a plain div, not
+     #search-form -- so `flex: 1` here has never done anything. .search-box
+     has correctly been growing to fill the row all along; nothing ever told
+     the input itself to fill .search-box, so it sat at its native ~170-200px
+     default width regardless. That's the actual bug three rounds of
+     reshaping the row (flex-basis, grid, the stack rebuild) never touched. */
+  width: 100%;
   min-width: 0;
   padding: 11px 14px;
   font-size: 16px; /* 16px stops iOS zooming the page on focus */
