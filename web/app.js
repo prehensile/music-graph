@@ -74,13 +74,20 @@ const PAGE_BG = '#0b1120';
 // built in initRenderer, not a canvas stroke.
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
-// Opacity multiplier for nodes/edges on screen that aren't directly
+const LABEL_COLOR = '#e2e8f0';
+// Opacity floor for nodes/edges/labels on screen that aren't directly
 // connected to whichever node is currently hovered -- see reduceNode/reduceEdge.
+// The transition toward and away from it is animated (see animateFade),
+// eased FADE_EASE of the remaining distance per frame; FADE_SNAP is how
+// close counts as "arrived", to stop the animation loop rather than
+// chasing an imperceptible remainder forever.
 const FADE_ALPHA = 0.2;
+const FADE_EASE = 0.25;
+const FADE_SNAP = 0.004;
 // Edges have no per-edge colour of their own (see the addEdge call in
-// merge()) -- EDGE_RGB/EDGE_ALPHA are the base grey both the default and the
-// faded variant (EDGE_COLOR/EDGE_COLOR_FADED, built below once
-// rgbaPremultiplied exists) are derived from.
+// merge()) -- EDGE_RGB/EDGE_ALPHA are the base grey both the default colour
+// (EDGE_COLOR, built below once rgbaPremultiplied exists) and reduceEdge's
+// animated faded one are derived from.
 const EDGE_RGB = [148, 163, 184];
 const EDGE_ALPHA = 0.35;
 
@@ -118,8 +125,16 @@ function withAlpha(hex, alpha) {
   return rgbaPremultiplied((n >> 16) & 255, (n >> 8) & 255, n & 255, alpha);
 }
 
+// Labels are drawn on a plain 2D canvas (see drawDiscNodeLabel/Jt in the
+// vendored sigma), not WebGL -- fillStyle composites with ordinary
+// (non-premultiplied) alpha, so unlike withAlpha above this must NOT
+// premultiply, or the label would fade twice as fast as the node it labels.
+function withAlphaCanvas(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
 const EDGE_COLOR = rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA);
-const EDGE_COLOR_FADED = rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA * FADE_ALPHA);
 
 /*
  * Custom hover-label renderer, wired in via the `defaultDrawNodeHover`
@@ -191,9 +206,18 @@ class Viewer {
     this.activeSuggestions = [];
     this.highlightedSuggestion = -1;
 
-    // Hover-fade state, read by reduceNode -- null when nothing is hovered.
+    // Hover-fade state. hoveredNode/hoveredNeighbours are what's exempt from
+    // fading; fadeCurrent is the live, animated alpha applied to everything
+    // else (see animateFade), easing toward fadeTarget rather than snapping.
+    // hoveredNode/hoveredNeighbours stay set through a roll-out (fadeTarget
+    // back to 1) until fadeCurrent actually gets there -- nulling them the
+    // instant the pointer leaves would leave nothing exempt while that
+    // transition was still playing.
     this.hoveredNode = null;
     this.hoveredNeighbours = null;
+    this.fadeCurrent = 1;
+    this.fadeTarget = 1;
+    this.fadeRaf = null;
 
     this.initRenderer();
     this.initLegend();
@@ -226,7 +250,9 @@ class Viewer {
       renderEdgeLabels: false,
       defaultNodeColor: COLOURS.Unknown,
       defaultEdgeColor: EDGE_COLOR,
-      labelColor: { color: '#e2e8f0' },
+      // `attribute` lets reduceNode override a faded node's label colour the
+      // same way it overrides fill/border -- see withAlphaCanvas.
+      labelColor: { attribute: 'labelColor', color: LABEL_COLOR },
       labelSize: 12,
       labelWeight: '500',
       labelDensity: 0.6,
@@ -257,13 +283,15 @@ class Viewer {
       document.body.style.cursor = 'pointer';
       this.hoveredNode = node;
       this.hoveredNeighbours = new Set(this.graph.neighbors(node));
+      this.fadeTarget = FADE_ALPHA;
+      this.animateFade();
       this.setHighlight(node);
       this.showPanel(node);
     });
     this.renderer.on('leaveNode', () => {
       document.body.style.cursor = 'default';
-      this.hoveredNode = null;
-      this.hoveredNeighbours = null;
+      this.fadeTarget = 1;
+      this.animateFade();
       this.setHighlight(null);
     });
     this.renderer.on('clickNode', ({ node }) => {
@@ -272,8 +300,8 @@ class Viewer {
       this.activate(node);
     });
     this.renderer.on('clickStage', () => {
-      this.hoveredNode = null;
-      this.hoveredNeighbours = null;
+      this.fadeTarget = 1;
+      this.animateFade();
       this.setHighlight(null);
     });
 
@@ -428,6 +456,16 @@ class Viewer {
     // A pinned custom bbox from a previous graph (see bindDrag) would
     // normalise this new one against stale bounds -- let sigma recompute.
     this.renderer.setCustomBBox(null);
+    // Snap the fade state back rather than animating it: a search can land
+    // mid-fade (hovering, then pressing Enter) with the pointer nowhere near
+    // the canvas afterwards, so nothing would ever fire leaveNode to
+    // un-fade the new graph -- and hoveredNode/hoveredNeighbours would be
+    // stale ids from the graph just cleared regardless.
+    if (this.fadeRaf) { cancelAnimationFrame(this.fadeRaf); this.fadeRaf = null; }
+    this.hoveredNode = null;
+    this.hoveredNeighbours = null;
+    this.fadeCurrent = 1;
+    this.fadeTarget = 1;
     this.setHighlight(null);
   }
 
@@ -766,29 +804,66 @@ class Viewer {
   }
 
   /*
-   * nodeReducer: on hover, fades every on-screen node that isn't the hovered
-   * node itself or one of its direct neighbours, restoring full opacity as
-   * soon as nothing is hovered (this.hoveredNode is null on rollout). Purely
-   * a render-time override -- the graph's own `color` attribute is untouched,
-   * so nothing else that reads it (legend, panel) needs to know about this.
+   * Eases fadeCurrent toward fadeTarget every animation frame and refreshes
+   * the renderer so reduceNode/reduceEdge pick up the new value each time --
+   * this is what makes the hover fade a transition rather than an instant
+   * snap. Re-targeting mid-flight (hovering a new node before the last
+   * one's roll-out finished) just changes fadeTarget under a loop that's
+   * already running, so it picks up smoothly from wherever fadeCurrent
+   * currently is rather than restarting. Only once fadeCurrent actually
+   * settles back at 1 (fully rolled out) are hoveredNode/hoveredNeighbours
+   * cleared -- see the constructor comment for why.
    */
-  reduceNode(node, data) {
-    if (!this.hoveredNode || node === this.hoveredNode || this.hoveredNeighbours.has(node)) {
-      return data;
-    }
-    return { ...data, color: withAlpha(data.color, FADE_ALPHA), borderColor: withAlpha(OUTLINE_COLOR, FADE_ALPHA) };
+  animateFade() {
+    if (this.fadeRaf) return;
+    const step = () => {
+      const diff = this.fadeTarget - this.fadeCurrent;
+      if (Math.abs(diff) < FADE_SNAP) {
+        this.fadeCurrent = this.fadeTarget;
+        this.fadeRaf = null;
+        if (this.fadeTarget === 1) {
+          this.hoveredNode = null;
+          this.hoveredNeighbours = null;
+        }
+        this.renderer.refresh();
+        return;
+      }
+      this.fadeCurrent += diff * FADE_EASE;
+      this.renderer.refresh();
+      this.fadeRaf = requestAnimationFrame(step);
+    };
+    this.fadeRaf = requestAnimationFrame(step);
   }
 
   /*
-   * edgeReducer counterpart to reduceNode: while a node is hovered, every
-   * edge not touching it fades to EDGE_COLOR_FADED; edges into/out of the
-   * hovered node are left alone.
+   * nodeReducer: fades every on-screen node that isn't the hovered node
+   * itself or one of its direct neighbours toward FADE_ALPHA, at whatever
+   * point animateFade's transition currently is. Purely a render-time
+   * override -- the graph's own `color`/`label` attributes are untouched,
+   * so nothing else that reads them (legend, panel) needs to know about
+   * this.
+   */
+  reduceNode(node, data) {
+    if (this.fadeCurrent >= 1 || node === this.hoveredNode || this.hoveredNeighbours?.has(node)) {
+      return data;
+    }
+    return {
+      ...data,
+      color: withAlpha(data.color, this.fadeCurrent),
+      borderColor: withAlpha(OUTLINE_COLOR, this.fadeCurrent),
+      labelColor: withAlphaCanvas(LABEL_COLOR, this.fadeCurrent),
+    };
+  }
+
+  /*
+   * edgeReducer counterpart to reduceNode: every edge not touching the
+   * hovered node fades the same way; edges into/out of it are left alone.
    */
   reduceEdge(edge, data) {
-    if (!this.hoveredNode) return data;
+    if (this.fadeCurrent >= 1) return data;
     const [source, target] = this.graph.extremities(edge);
     if (source === this.hoveredNode || target === this.hoveredNode) return data;
-    return { ...data, color: EDGE_COLOR_FADED };
+    return { ...data, color: rgbaPremultiplied(...EDGE_RGB, EDGE_ALPHA * this.fadeCurrent) };
   }
 
   /*
