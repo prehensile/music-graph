@@ -308,6 +308,13 @@ class Viewer {
     // drag from sigma's own mouse-capture layer underneath it.
     this.renderer.createCanvasContext('incompleteRing', { style: { pointerEvents: 'none' } });
     this.ringCtx = this.renderer.canvasContexts.incompleteRing;
+    // resize() sizes (and devicePixelRatio-scales) every layer's actual
+    // canvas element -- but bails out immediately unless the container's
+    // own size just changed, which it hasn't here. Called only from sigma's
+    // own constructor before this layer existed, our canvas would otherwise
+    // sit at the browser's default 300x150 backing store forever, i.e.
+    // never actually visible. `true` forces it through regardless.
+    this.renderer.resize(true);
     this.renderer.on('afterRender', () => this.drawIncompleteRings());
 
     // The info panel is a constant fixture, not a popup -- it always shows

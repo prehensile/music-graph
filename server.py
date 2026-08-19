@@ -485,6 +485,19 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    # No caching, static files (app.js, styles.css, index.html, ...)
+    # included: SimpleHTTPRequestHandler's default only sends Last-Modified,
+    # which is enough for a browser to cache heuristically with nothing
+    # explicit telling it not to -- exactly the failure mode that made a
+    # freshly-deployed CSS/JS change invisible on a plain reload during this
+    # project's edit-and-reload workflow (no build step, no cache-busted
+    # filenames). One override here covers every response, static or API,
+    # rather than each handler remembering to set it -- see _send_json,
+    # which used to set this itself.
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def _authorised(self):
         if APP_ALLOW_ANONYMOUS:
             return True
@@ -504,7 +517,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
