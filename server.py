@@ -325,6 +325,17 @@ class Graph:
         hop1 = self._neighbours(ids, limit)
         hop2 = self._neighbours([n["id"] for n in hop1["nodes"]], limit)
         merged = self._merge_payloads(hop1, hop2)
+        # hop2's call above ran _neighbours on every hop1 id too (it's what
+        # hop1["nodes"] feeds it), so those nodes' own neighbourhoods really
+        # were queried, same as the seeds -- only nodes hop2 introduces for
+        # the first time got no such call, and only show whichever edges
+        # happened to connect them back into the hop1 set. That's the
+        # "expanded" flag the client draws a dashed vs. solid ring from: not
+        # "on screen" but "asked about", which the client can't tell apart
+        # from the merged nodes/edges alone.
+        queried = set(ids) | {n["id"] for n in hop1["nodes"]}
+        for n in merged["nodes"]:
+            n["expanded"] = n["id"] in queried
         return self._cap_payload(merged, MAX_LIMIT)
 
     def _neighbours(self, ids, limit):

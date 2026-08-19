@@ -75,6 +75,9 @@ const PAGE_BG = '#0b1120';
 const OUTLINE_WIDTH = 2.5;
 const OUTLINE_COLOR = '#ffffff';
 const LABEL_COLOR = '#e2e8f0';
+// Dash/gap lengths (px) for an incomplete node's ring -- see
+// drawIncompleteRings and the `expanded` node attribute (merge()).
+const INCOMPLETE_RING_DASH = [4, 3];
 // How far nodes/labels/edges on screen that aren't directly connected to
 // whichever node is currently hovered tween toward PAGE_BG -- see
 // reduceNode/reduceEdge/lerpToBg. 0 = untouched, 1 = fully the background
@@ -296,6 +299,16 @@ class Viewer {
       nodeReducer: (node, data) => this.reduceNode(node, data),
       edgeReducer: (edge, data) => this.reduceEdge(edge, data),
     });
+
+    // A second canvas layer, on top of sigma's own, purely for the dashed
+    // "incomplete neighbourhood" ring (see drawIncompleteRings) -- the
+    // border node program only draws a solid ring, and WebGL has no notion
+    // of a dash pattern short of writing a custom shader. pointer-events
+    // stays off so this is strictly visual and never steals a hover/click/
+    // drag from sigma's own mouse-capture layer underneath it.
+    this.renderer.createCanvasContext('incompleteRing', { style: { pointerEvents: 'none' } });
+    this.ringCtx = this.renderer.canvasContexts.incompleteRing;
+    this.renderer.on('afterRender', () => this.drawIncompleteRings());
 
     // The info panel is a constant fixture, not a popup -- it always shows
     // the most recently hovered (or tapped) node, rather than opening and
@@ -627,7 +640,20 @@ class Viewer {
     const base = origin || { x: 0, y: 0 };
 
     (data.nodes || []).forEach((n) => {
-      if (this.graph.hasNode(n.id)) return;
+      // `expanded` (server-set in _expand_two_hop) means this node's own
+      // neighbourhood was actually queried -- true for a search/expand
+      // target and its direct neighbours, false for a node that only
+      // arrived because it happened to connect to one of those. Mirrored
+      // into this.expanded so a later tap on an already-complete node
+      // (e.g. one of the hop1 set) doesn't needlessly refetch it -- see
+      // activate(). Checked even for a node already on screen: it may have
+      // been added earlier as incomplete (hop2-only) and only now, via a
+      // different fetch, found out its own neighbourhood is complete.
+      if (n.expanded) this.expanded.add(n.id);
+      if (this.graph.hasNode(n.id)) {
+        if (n.expanded) this.graph.setNodeAttribute(n.id, 'expanded', true);
+        return;
+      }
       const angle = Math.random() * Math.PI * 2;
       const radius = 8 + Math.random() * 40;
       this.graph.addNode(n.id, {
@@ -857,23 +883,78 @@ class Viewer {
   }
 
   /*
-   * nodeReducer: tweens every on-screen node that isn't the hovered node
-   * itself or one of its direct neighbours toward the background colour, at
-   * whatever point animateFade's transition currently is (see FADE_MIX for
-   * why colour, not alpha). Purely a render-time override -- the graph's own
-   * `color`/`label` attributes are untouched, so nothing else that reads
-   * them (legend, panel) needs to know about this.
+   * Draws a dashed ring over every node whose neighbourhood isn't complete
+   * (`!expanded`, see merge()), on the extra canvas layer set up in
+   * initRenderer. Runs on sigma's own `afterRender` event rather than being
+   * folded into the border node program because WebGL has no dash pattern
+   * short of a custom shader, and because sigma only calls a node program's
+   * own `drawLabel`/`drawHover` for the hovered node or a label-density-
+   * selected subset -- not for every rendered node every frame, which is
+   * what a persistent per-node indicator needs.
+   *
+   * getNodeDisplayData/framedGraphToViewport/scaleSize are the same calls
+   * sigma's own label/hover drawing makes internally to go from a node's
+   * graph-space position and size to on-screen pixels, so this lines up
+   * with the WebGL-drawn node under it without reimplementing the camera
+   * math by hand.
+   */
+  drawIncompleteRings() {
+    const ctx = this.ringCtx;
+    const { width, height } = this.renderer.getDimensions();
+    ctx.clearRect(0, 0, width, height);
+    ctx.lineWidth = OUTLINE_WIDTH;
+    ctx.setLineDash(INCOMPLETE_RING_DASH);
+    this.graph.forEachNode((node, attrs) => {
+      if (attrs.expanded) return;
+      const display = this.renderer.getNodeDisplayData(node);
+      if (!display) return; // culled -- off-screen or otherwise not drawn this frame
+      const { x, y } = this.renderer.framedGraphToViewport(display);
+      // Half the ring's own width inward, so the dashed stroke (centred on
+      // its path by canvas convention) spans the same annulus the WebGL
+      // ring would have -- see reduceNode's `size` -> outer-edge relationship.
+      const r = this.renderer.scaleSize(display.size) - OUTLINE_WIDTH / 2;
+      ctx.strokeStyle = display.ringColor || OUTLINE_COLOR;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+  }
+
+  /*
+   * nodeReducer, doing two unrelated things at once (both cheap, so one pass
+   * covers both rather than composing two reducers):
+   *
+   * 1. Tweens every on-screen node that isn't the hovered node itself or one
+   *    of its direct neighbours toward the background colour, at whatever
+   *    point animateFade's transition currently is (see FADE_MIX for why
+   *    colour, not alpha).
+   * 2. Hides the WebGL border ring on an incomplete node (`!data.expanded`,
+   *    see merge()) by colouring it to match the fill, and stashes what the
+   *    ring *would* be in `ringColor` for drawIncompleteRings to read back
+   *    via getNodeDisplayData -- that's what actually draws its ring, as a
+   *    dashed one, on the canvas overlay created in initRenderer. A ring
+   *    that's solid-but-hidden underneath a dashed one drawn on top would
+   *    just show through the gaps, so the WebGL ring has to genuinely not
+   *    be there rather than merely be covered.
+   *
+   * Purely a render-time override either way -- the graph's own `color`/
+   * `label`/`expanded` attributes are untouched, so nothing else that reads
+   * them (legend, panel, drawIncompleteRings) needs to know about this.
    */
   reduceNode(node, data) {
-    if (this.fadeCurrent <= 0 || node === this.hoveredNode || this.hoveredNeighbours?.has(node)) {
-      return data;
-    }
-    return {
+    const faded = this.fadeCurrent > 0 && node !== this.hoveredNode && !this.hoveredNeighbours?.has(node);
+    const incomplete = !data.expanded;
+    if (!faded && !incomplete) return data;
+
+    const ring = faded ? lerpToBg(OUTLINE_COLOR, this.fadeCurrent) : OUTLINE_COLOR;
+    const out = {
       ...data,
-      color: lerpToBg(data.color, this.fadeCurrent),
-      borderColor: lerpToBg(OUTLINE_COLOR, this.fadeCurrent),
-      labelColor: lerpToBg(LABEL_COLOR, this.fadeCurrent),
+      color: faded ? lerpToBg(data.color, this.fadeCurrent) : data.color,
+      ringColor: ring,
     };
+    out.borderColor = incomplete ? out.color : ring;
+    if (faded) out.labelColor = lerpToBg(LABEL_COLOR, this.fadeCurrent);
+    return out;
   }
 
   /*
