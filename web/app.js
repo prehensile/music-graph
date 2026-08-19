@@ -972,11 +972,13 @@ class Viewer {
     });
 
     const maxSpeed = k * 0.6;
+    const newX = new Float64Array(nodes.length);
+    const newY = new Float64Array(nodes.length);
     let energy = 0;
 
     for (let i = 0; i < nodes.length; i += 1) {
       const id = nodes[i];
-      if (id === this.dragged) continue;   // kinematically pinned, not force-driven
+      if (id === this.dragged) { newX[i] = pos[i].x; newY[i] = pos[i].y; continue; }
 
       const v = this.velocity.get(id) || { vx: 0, vy: 0 };
       let vx = (v.vx + fx[i]) * PHYSICS.DAMPING;
@@ -995,19 +997,81 @@ class Viewer {
       const speed = Math.hypot(vx, vy);
       if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
 
-      const x = pos[i].x + vx;
-      const y = pos[i].y + vy;
-
-      g.setNodeAttribute(id, 'x', x);
-      g.setNodeAttribute(id, 'y', y);
+      newX[i] = pos[i].x + vx;
+      newY[i] = pos[i].y + vy;
       this.velocity.set(id, { vx, vy });
       energy += vx * vx + vy * vy;
+    }
+
+    /*
+     * Hard overlap correction -- a second, purely positional pass, separate
+     * from the force integration above. Repulsion only ever pushes nodes
+     * apart as a *force*; it settles wherever that force nets to ~0, which
+     * is not the same guarantee as "not overlapping", and two things above
+     * can each independently stall it short of that: maxSpeed caps every
+     * node's per-tick displacement at k*0.6 regardless of how much force is
+     * behind it, and DRIFT_FRICTION deliberately suppresses the exact kind
+     * of high per-tick speed a strong close-range shove produces (that's
+     * its job -- see DRIFT_FRICTION -- it just also fights this). Past
+     * whichever of those two saturates first, no amount of REPULSE_K does
+     * anything more per tick, so overlap can persist no matter how the
+     * spring/repulsion knobs are tuned. This pass sidesteps both: any pair
+     * still closer than the sum of their drawn radii gets shoved apart by
+     * exactly the overlap, split between them, independent of velocity --
+     * a plain Verlet-style contact solve, one relaxation step per tick
+     * (converging over a few frames) rather than iterating to convergence
+     * within a single one.
+     *
+     * `overlapping` keeps the sim awake while this is still doing work: the
+     * energy the sleep check below is built on comes only from the force
+     * pass, so a pair sitting deep inside each other's radii but past
+     * maxSpeed/DRIFT_FRICTION's reach could read as "settled" (near-zero
+     * velocity) while still visibly overlapping every frame.
+     */
+    let overlapping = false;
+    for (let i = 0; i < nodes.length; i += 1) {
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        let ax = newX[i] - newX[j];
+        let ay = newY[i] - newY[j];
+        const minSep = pos[i].size + pos[j].size;
+        let d2 = ax * ax + ay * ay;
+        if (d2 >= minSep * minSep) continue;
+        overlapping = true;
+        if (d2 < 0.01) {          // coincident nodes need a nudge to separate
+          ax = Math.random() - 0.5;
+          ay = Math.random() - 0.5;
+          d2 = ax * ax + ay * ay || 0.01;
+        }
+        const d = Math.sqrt(d2);
+        const nx = ax / d;
+        const ny = ay / d;
+        const iPinned = nodes[i] === this.dragged;
+        const jPinned = nodes[j] === this.dragged;
+        // A pinned node doesn't move for this either -- the other one
+        // absorbs the full correction instead of the usual half each.
+        const push = minSep - d;
+        if (!iPinned) {
+          const share = jPinned ? push : push / 2;
+          newX[i] += nx * share; newY[i] += ny * share;
+        }
+        if (!jPinned) {
+          const share = iPinned ? push : push / 2;
+          newX[j] -= nx * share; newY[j] -= ny * share;
+        }
+      }
+    }
+
+    for (let i = 0; i < nodes.length; i += 1) {
+      const id = nodes[i];
+      if (id === this.dragged) continue;   // kinematically pinned, not force-driven
+      g.setNodeAttribute(id, 'x', newX[i]);
+      g.setNodeAttribute(id, 'y', newY[i]);
     }
 
     this.renderer.refresh();
     this.awakeFrames += 1;
 
-    const settled = (energy / nodes.length) < PHYSICS.SLEEP_ENERGY;
+    const settled = !overlapping && (energy / nodes.length) < PHYSICS.SLEEP_ENERGY;
     if (this.dragged || (!settled && this.awakeFrames < PHYSICS.MAX_AWAKE_FRAMES)) {
       this.raf = requestAnimationFrame(() => this.physicsTick());
     } else {
