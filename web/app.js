@@ -355,13 +355,23 @@ class Viewer {
       edgeReducer: (edge, data) => this.reduceEdge(edge, data),
     });
 
-    // A second canvas layer, on top of sigma's own, purely for the dashed
-    // "incomplete neighbourhood" ring (see drawIncompleteRings) -- the
-    // border node program only draws a solid ring, and WebGL has no notion
-    // of a dash pattern short of writing a custom shader. pointer-events
-    // stays off so this is strictly visual and never steals a hover/click/
-    // drag from sigma's own mouse-capture layer underneath it.
-    this.renderer.createCanvasContext('incompleteRing', { style: { pointerEvents: 'none' } });
+    // A second canvas layer, purely for the dashed "incomplete neighbourhood"
+    // ring (see drawIncompleteRings) -- the border node program only draws a
+    // solid ring, and WebGL has no notion of a dash pattern short of writing
+    // a custom shader. pointer-events stays off so this is strictly visual
+    // and never steals a hover/click/drag from sigma's own mouse-capture
+    // layer underneath it. `beforeLayer: 'labels'` is load-bearing: sigma's
+    // own layer order is edges, edgeLabels, nodes, labels, hovers, hoverNodes,
+    // mouse, and createCanvasContext with no position just appends -- on top
+    // of labels and hovers as well as nodes. That put the dashed ring above
+    // every node's label instead of only above the (solid-ringed) node it
+    // stands in for. Inserted before 'labels' instead, it sits directly on
+    // top of the nodes layer, matching where the solid ring it replaces
+    // actually lives.
+    this.renderer.createCanvasContext('incompleteRing', {
+      style: { pointerEvents: 'none' },
+      beforeLayer: 'labels',
+    });
     this.ringCtx = this.renderer.canvasContexts.incompleteRing;
     // resize() sizes (and devicePixelRatio-scales) every layer's actual
     // canvas element -- but bails out immediately unless the container's
