@@ -85,12 +85,16 @@ const DEFAULT_PHYSICS = {
   // 90 -> 160 once removing the layout's centring gravity entirely made
   // that same knotting visible again -- gravity's constant inward pull had
   // been partly masking under-strength repulsion by keeping everything
-  // nearer the centre rather than letting hubs actually spread apart; and
-  // to 800, alongside SPRING_K down at its own floor, from hand-tuning in
-  // the physics panel once COLLISION_ITERATIONS existed to keep the result
-  // overlap-free regardless -- with springs barely resisting it, repulsion
-  // alone needs to be this strong to spread a knot out to begin with.
-  REPULSE_K: 800,
+  // nearer the centre rather than letting hubs actually spread apart; then
+  // to 800 (alongside SPRING_K down at its own floor) while chasing
+  // persistent visual overlap that turned out to be a real bug elsewhere
+  // (see itemSizesReference in initRenderer) -- physics and the renderer
+  // disagreed about what `size` meant, so no REPULSE_K, however high,
+  // could actually close a gap that was a unit mismatch rather than a
+  // strength one. Settled back down to 30 once that was fixed: properly
+  // unit-matched repulsion needs nowhere near as much force to keep a knot
+  // spread and overlap-free.
+  REPULSE_K: 30,
   // How close (in drawn-radius units) a pair's repulsion is allowed to
   // treat them as being, at minimum -- below this, the force stops
   // climbing toward infinity as d -> 0 and plateaus instead. 0 would let
@@ -100,8 +104,8 @@ const DEFAULT_PHYSICS = {
   // as a floor anyway, so the two no longer disagree about how close is
   // too close.
   SIZE_REPULSE_PAD: 1,
-  SPRING_K: 0.005,
-  DAMPING: 0.8,
+  SPRING_K: 0.13,
+  DAMPING: 0.5,
   // DAMPING above removes the same *fraction* of a node's velocity every
   // tick regardless of how fast it's moving, so it does nothing extra
   // against a burst of speed specifically -- and a dense knot repelling
@@ -116,7 +120,7 @@ const DEFAULT_PHYSICS = {
   // nodes do while settling into a knot -- unlike raising DAMPING, which
   // would slow both equally and make knots even slower to spread
   // internally.
-  DRIFT_FRICTION: 0.03,
+  DRIFT_FRICTION: 0.2,
   // No centring gravity at all -- there used to be one (first a pull felt
   // at every radius, then narrowed to a dead-zone wall), and both versions
   // still visibly rounded the graph off into a circle over time. Any force
@@ -154,8 +158,8 @@ const PHYSICS_PARAMS = [
   { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 1000, step: 5, decimals: 0 },
   { key: 'SIZE_REPULSE_PAD', label: 'Repulsion floor', min: 1, max: 3, step: 0.05, decimals: 2 },
   { key: 'SPRING_K', label: 'Spring strength', min: 0.005, max: 0.15, step: 0.005, decimals: 3 },
-  { key: 'DAMPING', label: 'Damping', min: 0.5, max: 0.95, step: 0.01, decimals: 2 },
-  { key: 'DRIFT_FRICTION', label: 'Drift friction', min: 0, max: 0.2, step: 0.005, decimals: 3 },
+  { key: 'DAMPING', label: 'Damping', min: 0.2, max: 0.95, step: 0.01, decimals: 2 },
+  { key: 'DRIFT_FRICTION', label: 'Drift friction', min: 0, max: 0.4, step: 0.005, decimals: 3 },
   { key: 'AREA_SIDE', label: 'Area side', min: 300, max: 2000, step: 20, decimals: 0 },
   { key: 'SLEEP_ENERGY', label: 'Sleep threshold', min: 0.0001, max: 0.005, step: 0.0001, decimals: 4 },
   { key: 'MAX_AWAKE_FRAMES', label: 'Max awake frames', min: 100, max: 3000, step: 50, decimals: 0 },
