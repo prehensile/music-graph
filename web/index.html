@@ -17,8 +17,12 @@
 <header>
   <h1>Music&nbsp;Graph</h1>
   <form id="search-form" autocomplete="off">
-    <input type="search" id="q" placeholder="Search artists, releases, labels…"
-           aria-label="Search" enterkeyhint="search">
+    <div class="search-box">
+      <input type="search" id="q" placeholder="Search artists, releases, labels…"
+             aria-label="Search" enterkeyhint="search" autocomplete="off"
+             role="combobox" aria-expanded="false" aria-controls="suggestions" aria-autocomplete="list">
+      <ul id="suggestions" class="suggestions" role="listbox" hidden></ul>
+    </div>
     <button type="submit" id="go">Search</button>
   </form>
 </header>
@@ -33,13 +37,11 @@
 
   <div id="spinner" class="overlay" hidden><div class="dot"></div>Loading…</div>
 
-  <aside id="panel" hidden>
-    <button id="panel-close" aria-label="Close">&times;</button>
+  <aside id="panel">
     <span class="pill" id="panel-kind"></span>
-    <h2 id="panel-title"></h2>
+    <h2 id="panel-title">Hover a node</h2>
     <dl id="panel-meta"></dl>
-    <p id="panel-profile"></p>
-    <button id="panel-expand">Expand neighbours</button>
+    <p id="panel-profile">Tap or hover any node to see its details here.</p>
   </aside>
 </main>
 

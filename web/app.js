@@ -2,9 +2,15 @@
  * Music Graph viewer.
  *
  * Talks only to this server's own JSON API -- no database credentials reach the
- * page and no Cypher is built here. Layout is Fruchterman-Reingold with a
- * cooling schedule (see runLayout), so hub-heavy Discogs subgraphs settle
- * instead of oscillating the way the original viewer's uncooled simulation did.
+ * page and no Cypher is built here. Layout is a damped mass-spring simulation
+ * (see wake/physicsTick) that runs continuously rather than settling once and
+ * stopping: repulsion keeps nodes apart, edges act as springs, and dragging a
+ * node perturbs its neighbours and lets go with momentum, so the graph visibly
+ * "boings" back into equilibrium instead of just snapping into place.
+ *
+ * The info panel is a constant fixture rather than a popup: it always shows
+ * whichever node was hovered or tapped most recently (see showPanel), and
+ * tapping is also what fetches a node's neighbourhood (see activate).
  */
 'use strict';
 
@@ -23,15 +29,120 @@ const REL_LABEL = {
   SUBLABEL:    'sublabel of',
 };
 
+// Live search (see fetchSuggestions): wait this long after the last keystroke
+// before hitting /api/suggest, and don't bother firing below this many chars
+// -- both keep a fast typist from spamming the endpoint on every keystroke.
+const SUGGEST_DEBOUNCE_MS = 180;
+const SUGGEST_MIN_CHARS = 2;
+
+// Tuned for a viewport-ish 820x820 spread of a few hundred nodes -- see
+// physicsTick. REPULSE/SPRING set the forces, DAMPING is what makes them
+// settle instead of oscillating forever, and MAX_AWAKE_FRAMES is a safety
+// valve in case some pathological layout never quite dips under SLEEP_ENERGY.
+const AREA_SIDE = 820;
+const REPULSE_K = 0.35;
+// How much of a node pair's own drawn radius (see sizeFor) gets added to `k`
+// as extra required separation -- 0 would repeat the old size-blind
+// behaviour, 1 would demand a full gap equal to their combined radii. 1.8
+// leaves a generous margin between two touching hubs rather than just
+// preventing their circles from intersecting.
+const SIZE_REPULSE_PAD = 1.8;
+const SPRING_K = 0.03;
+const DAMPING = 0.82;
+const GRAVITY = 0.008;
+const SLEEP_ENERGY = 0.0004;   // average per-node kinetic energy to go idle
+const MAX_AWAKE_FRAMES = 900;  // ~15s at 60fps
+
+// Keep in sync with styles.css's --bg -- the hover label's text is knocked
+// out in this colour (see drawHoverLabel) so it reads as cut from the pill
+// behind it rather than printed on it.
+const PAGE_BG = '#0b1120';
+// The white node rim's width/colour -- consumed by the border node program
+// built in initRenderer, not a canvas stroke.
+const OUTLINE_WIDTH = 1.5;
+const OUTLINE_COLOR = '#ffffff';
+
+// Node size grows fast with degree up to about SIZE_KNEE connections, then
+// flattens -- a hub with hundreds of connections should not dwarf everything
+// else, but the difference between 1 and 8 connections should be obvious.
+const SIZE_MIN = 4;
+const SIZE_MAX = 26;
+const SIZE_KNEE = 10;
+// Reaches ~90% of the size range right at SIZE_KNEE, so most of the visible
+// variation happens by degree ~10 and higher degrees taper off logarithmically.
+const SIZE_SCALE = 0.9 * (SIZE_MAX - SIZE_MIN) / Math.log2(SIZE_KNEE + 1);
+
 const $ = (id) => document.getElementById(id);
+
+/*
+ * Custom hover-label renderer, wired in via the `defaultDrawNodeHover`
+ * setting in place of sigma's own: a pill in the node's own colour, with the
+ * text knocked out in the page background colour so it reads as cut from the
+ * pill rather than printed on it. The pill-around-node shape (an arc bridged
+ * by two straight edges) is sigma's usual approach for wrapping a label box
+ * around the node it labels.
+ */
+function drawHoverLabel(context, data, settings) {
+  const size = settings.labelSize;
+  const font = settings.labelFont;
+  const weight = settings.labelWeight;
+  const label = data.label;
+
+  context.fillStyle = data.color || COLOURS.Unknown;
+
+  if (!label) {
+    context.beginPath();
+    context.arc(data.x, data.y, data.size + 2, 0, Math.PI * 2);
+    context.closePath();
+    context.fill();
+    return;
+  }
+
+  context.font = `${weight} ${size}px ${font}`;
+  const PADDING = 3;
+  const textWidth = context.measureText(label).width;
+  const boxWidth = Math.round(textWidth + 8);
+  const boxHeight = Math.round(size + 2 * PADDING);
+  const radius = Math.max(data.size, size / 2) + PADDING;
+  const angleRadian = Math.asin(Math.min(1, boxHeight / 2 / radius));
+  const xDelta = Math.sqrt(Math.abs(radius * radius - (boxHeight / 2) ** 2));
+
+  context.beginPath();
+  context.moveTo(data.x + xDelta, data.y + boxHeight / 2);
+  context.lineTo(data.x + radius + boxWidth, data.y + boxHeight / 2);
+  context.lineTo(data.x + radius + boxWidth, data.y - boxHeight / 2);
+  context.lineTo(data.x + xDelta, data.y - boxHeight / 2);
+  context.arc(data.x, data.y, radius, angleRadian, -angleRadian);
+  context.closePath();
+  context.fill();
+
+  context.fillStyle = PAGE_BG;
+  context.fillText(label, data.x + data.size + 3, data.y + size / 3);
+}
 
 class Viewer {
   constructor() {
     this.graph = new graphology.Graph({ multi: false, type: 'undirected' });
     this.renderer = null;
-    this.layout = null;
-    this.selected = null;
     this.expanded = new Set();
+
+    // Physics state, kept outside graphology since it is not rendered.
+    this.velocity = new Map();   // nodeId -> {vx, vy}
+    this.raf = null;
+    this.awakeFrames = 0;
+    this.pendingFit = false;     // camera should re-fit once the sim settles
+
+    // Drag state.
+    this.dragged = null;
+    this.didDrag = false;
+    this.dragVX = 0;
+    this.dragVY = 0;
+
+    // Live-search state.
+    this.suggestTimer = null;
+    this.suggestToken = null;   // stale-response guard, see fetchSuggestions
+    this.activeSuggestions = [];
+    this.highlightedSuggestion = -1;
 
     this.initRenderer();
     this.initLegend();
@@ -42,6 +153,20 @@ class Viewer {
   // ---------------------------------------------------------------- setup
 
   initRenderer() {
+    // A white rim around every node, as a genuine WebGL node program rather
+    // than a per-frame canvas overlay: sigma 3 bundles createNodeBorderProgram
+    // into the core UMD build (window.Sigma.rendering), so no extra package is
+    // needed -- unlike the standalone @sigma/node-border, which targets sigma 3
+    // but ships no UMD build of its own and would need a bundler to vendor.
+    // Concentric rings from the outside in: a fixed-width white ring, then the
+    // node's own colour filling the rest.
+    const nodeProgram = Sigma.rendering.createNodeBorderProgram({
+      borders: [
+        { size: { value: OUTLINE_WIDTH, mode: 'pixels' }, color: { value: OUTLINE_COLOR } },
+        { size: { fill: true }, color: { attribute: 'color' } },
+      ],
+    });
+
     this.renderer = new Sigma(this.graph, $('graph'), {
       renderEdgeLabels: false,
       defaultNodeColor: COLOURS.Unknown,
@@ -56,16 +181,87 @@ class Viewer {
       maxCameraRatio: 12,
       allowInvalidContainer: true,
       zIndex: true,
+      nodeProgramClasses: { circle: nodeProgram },
+      // Sigma 3 moved per-node-state drawing off the top-level `hoverRenderer`
+      // setting and onto each node program; `defaultDrawNodeHover` is the
+      // renderer-wide fallback used when a program (like the border one
+      // above) doesn't set its own `drawHover`.
+      defaultDrawNodeHover: drawHoverLabel,
     });
 
-    this.renderer.on('clickNode', ({ node }) => this.select(node));
-    this.renderer.on('doubleClickNode', ({ node, event }) => {
-      if (event && event.preventSigmaDefault) event.preventSigmaDefault();
-      this.expand(node);
+    // The info panel is a constant fixture, not a popup -- it always shows
+    // the most recently hovered (or tapped) node, rather than opening and
+    // closing per interaction.
+    this.renderer.on('enterNode', ({ node }) => {
+      document.body.style.cursor = 'pointer';
+      this.setHighlight(node);
+      this.showPanel(node);
     });
-    this.renderer.on('enterNode', () => { document.body.style.cursor = 'pointer'; });
-    this.renderer.on('leaveNode', () => { document.body.style.cursor = 'default'; });
-    this.renderer.on('clickStage', () => this.select(null));
+    this.renderer.on('leaveNode', () => {
+      document.body.style.cursor = 'default';
+      this.setHighlight(null);
+    });
+    this.renderer.on('clickNode', ({ node }) => {
+      // downNode/mousemovebody fire for a drag too; a real click never moved.
+      if (this.didDrag) { this.didDrag = false; return; }
+      this.activate(node);
+    });
+    this.renderer.on('clickStage', () => this.setHighlight(null));
+
+    this.bindDrag();
+  }
+
+  /*
+   * Node dragging, following sigma's own drag-nodes pattern: `downNode` marks
+   * the node being dragged, `mousemovebody` (fires even off-canvas) updates
+   * its position and calls `preventSigmaDefault` so sigma's own click-drag
+   * camera pan does not also fire, and plain `mouseup` releases it. Dragging
+   * on empty space is untouched, so panning the background still works.
+   */
+  bindDrag() {
+    const renderer = this.renderer;
+    const captor = renderer.getMouseCaptor();
+
+    renderer.on('downNode', ({ node }) => {
+      this.dragged = node;
+      this.didDrag = false;
+      this.dragVX = 0;
+      this.dragVY = 0;
+      this.graph.setNodeAttribute(node, 'highlighted', true);
+      this.wake();
+    });
+
+    captor.on('mousemovebody', (e) => {
+      if (!this.dragged) return;
+      this.didDrag = true;
+      const pos = renderer.viewportToGraph(e);
+      const prev = this.graph.getNodeAttributes(this.dragged);
+      // Smoothed so the release velocity isn't dominated by one jumpy sample.
+      this.dragVX = this.dragVX * 0.7 + (pos.x - prev.x) * 0.3;
+      this.dragVY = this.dragVY * 0.7 + (pos.y - prev.y) * 0.3;
+      this.graph.setNodeAttribute(this.dragged, 'x', pos.x);
+      this.graph.setNodeAttribute(this.dragged, 'y', pos.y);
+      e.preventSigmaDefault();
+      e.original.preventDefault();
+      e.original.stopPropagation();
+    });
+
+    captor.on('mouseup', () => {
+      if (!this.dragged) return;
+      this.graph.removeNodeAttribute(this.dragged, 'highlighted');
+      // Hand the node its drag velocity so releasing it flings it free --
+      // spring and repulsion then bounce it back into place, the "boing".
+      this.velocity.set(this.dragged, { vx: this.dragVX * 5, vy: this.dragVY * 5 });
+      this.dragged = null;
+      this.wake();
+    });
+
+    // Pins the camera's fit bounds to their pre-drag extent, otherwise sigma
+    // auto-fits to the bounding box and dragging a node outward makes the
+    // whole view rescale under the finger.
+    captor.on('mousedown', () => {
+      if (!renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+    });
   }
 
   initLegend() {
@@ -78,6 +274,7 @@ class Viewer {
   bindEvents() {
     $('search-form').addEventListener('submit', (e) => {
       e.preventDefault();
+      this.hideSuggestions();
       const term = $('q').value.trim();
       if (term) {
         $('q').blur();           // dismisses the on-screen keyboard
@@ -85,9 +282,15 @@ class Viewer {
       }
     });
     $('reset').addEventListener('click', () => this.clear());
-    $('panel-close').addEventListener('click', () => this.select(null));
-    $('panel-expand').addEventListener('click', () => {
-      if (this.selected) this.expand(this.selected);
+
+    const input = $('q');
+    input.addEventListener('input', () => this.onSearchInput());
+    input.addEventListener('keydown', (e) => this.onSearchKeydown(e));
+    // Delayed so a suggestion's own mousedown handler (which fires first,
+    // see renderSuggestions) gets a chance to act before blur wipes the list.
+    input.addEventListener('blur', () => setTimeout(() => this.hideSuggestions(), 150));
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.search-box')) this.hideSuggestions();
     });
   }
 
@@ -128,17 +331,18 @@ class Viewer {
     }
   }
 
+  // Search results already come back with first- and second-order neighbours
+  // (see server.py's _expand_two_hop), so nothing further is fetched here.
   async search(term) {
     this.busy(true);
     try {
       const data = await this.api(`/api/search?q=${encodeURIComponent(term)}`);
-      this.graph.clear();
-      this.expanded.clear();
-      this.select(null);
+      this.beginNewGraph();
       const added = this.merge(data);
       $('hint').hidden = added > 0;
       if (!added) this.toast(`Nothing found for “${term}”`);
-      this.runLayout();
+      this.pendingFit = true;
+      this.wake();
     } catch (err) {
       this.toast(err.message);
     } finally {
@@ -146,21 +350,142 @@ class Viewer {
     }
   }
 
-  async expand(nodeId) {
-    if (this.expanded.has(nodeId)) return;
-    this.expanded.add(nodeId);
+  // Shared reset step between a committed search and picking a live-search
+  // suggestion: both replace whatever's on screen rather than merging into it.
+  beginNewGraph() {
+    this.graph.clear();
+    this.velocity.clear();
+    this.expanded.clear();
+    // A pinned custom bbox from a previous graph (see bindDrag) would
+    // normalise this new one against stale bounds -- let sigma recompute.
+    this.renderer.setCustomBBox(null);
+    this.setHighlight(null);
+  }
+
+  // ---------------------------------------------------------- live search
+
+  onSearchInput() {
+    const term = $('q').value.trim();
+    clearTimeout(this.suggestTimer);
+    if (term.length < SUGGEST_MIN_CHARS) {
+      this.hideSuggestions();
+      return;
+    }
+    this.suggestTimer = setTimeout(() => this.fetchSuggestions(term), SUGGEST_DEBOUNCE_MS);
+  }
+
+  onSearchKeydown(e) {
+    if (!this.activeSuggestions.length) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      this.highlightedSuggestion = Math.min(
+        this.highlightedSuggestion + 1, this.activeSuggestions.length - 1,
+      );
+      this.updateHighlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      this.highlightedSuggestion = Math.max(this.highlightedSuggestion - 1, 0);
+      this.updateHighlight();
+    } else if (e.key === 'Enter' && this.highlightedSuggestion >= 0) {
+      // No suggestion highlighted -> fall through to the form's own submit,
+      // which runs the full-text `search` instead.
+      e.preventDefault();
+      this.selectSuggestion(this.highlightedSuggestion);
+    } else if (e.key === 'Escape') {
+      this.hideSuggestions();
+    }
+  }
+
+  async fetchSuggestions(term) {
+    // A newer keystroke's request can land before an older one's -- only the
+    // most recently issued token is allowed to render its results.
+    const token = Symbol();
+    this.suggestToken = token;
+    try {
+      const data = await this.api(`/api/suggest?q=${encodeURIComponent(term)}`);
+      if (this.suggestToken !== token) return;
+      this.renderSuggestions(data.results || []);
+    } catch (_) {
+      if (this.suggestToken === token) this.hideSuggestions();
+    }
+  }
+
+  renderSuggestions(results) {
+    this.activeSuggestions = results;
+    this.highlightedSuggestion = -1;
+    const list = $('suggestions');
+    if (!results.length) {
+      this.hideSuggestions();
+      return;
+    }
+    list.innerHTML = results.map((r, i) => `
+      <li class="suggestion" data-index="${i}" role="option">
+        <span class="suggestion-dot" style="background:${COLOURS[r.kind] || COLOURS.Unknown}"></span>
+        <span class="suggestion-body">
+          <span class="suggestion-title">${esc(r.title)}<span class="suggestion-kind">${esc(r.kind)}</span></span>
+          <span class="suggestion-sub">${esc(this.subtitleFor(r))}</span>
+        </span>
+      </li>`).join('');
+    // mousedown, not click: it fires before the input's blur handler would
+    // otherwise wipe the list out from under the tap.
+    list.querySelectorAll('.suggestion').forEach((el) => {
+      el.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        this.selectSuggestion(Number(el.dataset.index));
+      });
+    });
+    list.hidden = false;
+    $('q').setAttribute('aria-expanded', 'true');
+  }
+
+  // Artist/Group/Label already carry their own bio (server.py's `suggest`
+  // reuses the same `profile` property); a Release has none, so it's
+  // described by what it's tied to instead.
+  subtitleFor(r) {
+    if (r.kind === 'Release') {
+      const parts = [];
+      if (r.artists.length) parts.push(r.artists.join(', '));
+      if (r.labels.length) parts.push(r.labels.join(', '));
+      if (r.year) parts.push(String(r.year));
+      return parts.join(' · ') || 'Release';
+    }
+    return r.profile || r.kind;
+  }
+
+  updateHighlight() {
+    const items = $('suggestions').querySelectorAll('.suggestion');
+    items.forEach((el, i) => el.classList.toggle('active', i === this.highlightedSuggestion));
+    items[this.highlightedSuggestion]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  hideSuggestions() {
+    const list = $('suggestions');
+    list.hidden = true;
+    list.innerHTML = '';
+    this.activeSuggestions = [];
+    this.highlightedSuggestion = -1;
+    $('q').setAttribute('aria-expanded', 'false');
+  }
+
+  // Jumps straight to the chosen node -- its own elementId from the
+  // full-text hit, not a fresh guess -- rather than re-running a full-text
+  // search on its title.
+  async selectSuggestion(index) {
+    const picked = this.activeSuggestions[index];
+    if (!picked) return;
+    this.hideSuggestions();
+    $('q').value = picked.title;
     this.busy(true);
     try {
-      const data = await this.api(`/api/expand?id=${encodeURIComponent(nodeId)}`);
-      // Seed new nodes near their parent so the layout has a sane starting point.
-      const origin = this.graph.hasNode(nodeId)
-        ? this.graph.getNodeAttributes(nodeId)
-        : { x: 0, y: 0 };
-      const added = this.merge(data, origin);
-      if (!added) this.toast('No further connections');
-      this.runLayout();
+      const data = await this.api(`/api/expand?id=${encodeURIComponent(picked.id)}`);
+      this.beginNewGraph();
+      this.merge(data);
+      this.expanded.add(picked.id);
+      $('hint').hidden = true;
+      this.pendingFit = true;
+      this.wake();
+      if (this.graph.hasNode(picked.id)) this.showPanel(picked.id);
     } catch (err) {
-      this.expanded.delete(nodeId);
       this.toast(err.message);
     } finally {
       this.busy(false);
@@ -174,16 +499,7 @@ class Viewer {
     const base = origin || { x: 0, y: 0 };
 
     (data.nodes || []).forEach((n) => {
-      if (this.graph.hasNode(n.id)) {
-        // Keep the larger degree so a node does not shrink when re-seen in a
-        // smaller subgraph.
-        const prev = this.graph.getNodeAttribute(n.id, 'degree') || 0;
-        if (n.degree > prev) {
-          this.graph.setNodeAttribute(n.id, 'degree', n.degree);
-          this.graph.setNodeAttribute(n.id, 'size', this.sizeFor(n.degree));
-        }
-        return;
-      }
+      if (this.graph.hasNode(n.id)) return;
       const angle = Math.random() * Math.PI * 2;
       const radius = 8 + Math.random() * 40;
       this.graph.addNode(n.id, {
@@ -197,6 +513,7 @@ class Viewer {
         size: this.sizeFor(n.degree),
         color: COLOURS[n.label] || COLOURS.Unknown,
       });
+      this.velocity.set(n.id, { vx: 0, vy: 0 });
       added += 1;
     });
 
@@ -207,60 +524,61 @@ class Viewer {
       this.graph.addEdge(e.source, e.target, { type_: e.type, size: 1 });
     });
 
+    // Size reflects connections actually visible in the accumulated graph --
+    // not just what this one fetch returned -- so a node keeps growing as
+    // more of its neighbourhood gets pulled in across searches/selections.
+    this.graph.forEachNode((node) => {
+      this.graph.setNodeAttribute(node, 'size', this.sizeFor(this.graph.degree(node)));
+    });
+
     return added;
   }
 
   sizeFor(degree) {
-    return Math.max(4, Math.min(26, 4 + Math.log2((degree || 0) + 1) * 3.2));
+    const d = Math.max(0, degree || 0);
+    return Math.min(SIZE_MAX, SIZE_MIN + Math.log2(d + 1) * SIZE_SCALE);
   }
 
   /*
-   * Fruchterman-Reingold with a cooling schedule, run in animation-frame
-   * batches so the graph is seen to settle and the UI stays responsive.
+   * Damped mass-spring simulation, run continuously in animation-frame ticks
+   * rather than a bounded cooling schedule: repulsion between every pair of
+   * nodes, spring attraction along edges pulling toward an ideal separation,
+   * and velocity damping so perturbing the graph (adding nodes, dragging a
+   * node) settles back down instead of jittering forever. It goes to sleep
+   * once kinetic energy drops below SLEEP_ENERGY (or after MAX_AWAKE_FRAMES
+   * regardless, as a safety net) and wake() restarts it on demand.
    *
-   * The view is capped at a few hundred nodes, so O(n^2) repulsion costs
-   * nothing and Barnes-Hut is not worth a dependency. Cooling is the part the
-   * original viewer lacked: it ran a constant-energy simulation forever, with
-   * elastic collision impulses fighting the springs, so hub-heavy subgraphs
-   * jittered indefinitely instead of coming to rest.
+   * The view is capped at a few hundred nodes, so O(n^2) repulsion is cheap
+   * and Barnes-Hut is not worth a dependency.
    */
-  runLayout() {
-    if (this.raf) cancelAnimationFrame(this.raf);
-    const nodes = this.graph.nodes();
-    if (!nodes.length) return;
-
-    const k = Math.sqrt((820 * 820) / nodes.length); // ideal separation
-    const MAX_ITER = 240;
-    let temp = k * 0.85;
-    let iter = 0;
-
-    const step = () => {
-      for (let pass = 0; pass < 4 && iter < MAX_ITER; pass += 1, iter += 1) {
-        this.layoutTick(nodes, k, temp);
-        temp *= 0.955;
-      }
-      this.renderer.refresh();
-      if (iter < MAX_ITER) {
-        this.raf = requestAnimationFrame(step);
-      } else {
-        this.raf = null;
-        // Pull back slightly once settled: sigma fits node centres, which
-        // leaves labels on the outermost nodes clipped at the viewport edge.
-        this.renderer.getCamera().animate(
-          { x: 0.5, y: 0.5, ratio: 1.2 }, { duration: 320 },
-        );
-      }
-    };
-    this.raf = requestAnimationFrame(step);
+  wake() {
+    this.awakeFrames = 0;
+    if (this.raf) return;
+    this.raf = requestAnimationFrame(() => this.physicsTick());
   }
 
-  layoutTick(nodes, k, temp) {
+  physicsTick() {
+    const nodes = this.graph.nodes();
+    if (!nodes.length) { this.raf = null; return; }
+
     const g = this.graph;
-    const dx = new Float64Array(nodes.length);
-    const dy = new Float64Array(nodes.length);
+    const k = Math.sqrt((AREA_SIDE * AREA_SIDE) / nodes.length); // ideal separation
     const index = new Map(nodes.map((n, i) => [n, i]));
     const pos = nodes.map((n) => g.getNodeAttributes(n));
+    const fx = new Float64Array(nodes.length);
+    const fy = new Float64Array(nodes.length);
 
+    // Repulsion: every pair pushes apart, inverse-square, so distant nodes
+    // barely feel it but crowded ones spring open -- this is what makes a
+    // dragged node shove its neighbours out of the way in real time.
+    //
+    // The target separation is `k` widened by the pair's own drawn size, not
+    // `k` alone. `k` only knows the node *count* (see above), but a hub's
+    // size grows independently as more of its neighbourhood gets merged in
+    // (see sizeFor) -- without this, a big node's springs could settle its
+    // neighbours at distance `k` while `k` itself was smaller than the two
+    // nodes' combined radii, leaving them visually overlapping however
+    // "correctly spaced" the force model considered them.
     for (let i = 0; i < nodes.length; i += 1) {
       for (let j = i + 1; j < nodes.length; j += 1) {
         let ax = pos[i].x - pos[j].x;
@@ -272,49 +590,114 @@ class Viewer {
           d2 = ax * ax + ay * ay || 0.01;
         }
         const d = Math.sqrt(d2);
-        const f = (k * k) / d / d * k * 0.25;
-        dx[i] += (ax / d) * f; dy[i] += (ay / d) * f;
-        dx[j] -= (ax / d) * f; dy[j] -= (ay / d) * f;
+        const target = k + (pos[i].size + pos[j].size) * SIZE_REPULSE_PAD;
+        const f = REPULSE_K * (target * target) / d2;
+        fx[i] += (ax / d) * f; fy[i] += (ay / d) * f;
+        fx[j] -= (ax / d) * f; fy[j] -= (ay / d) * f;
       }
     }
 
+    // Springs: edges pull toward the ideal separation `k`, both attracting
+    // stretched-out neighbours and pushing back on ones squeezed together --
+    // the latter is what makes a released node's neighbours bounce.
     g.forEachEdge((_e, _a, source, target) => {
       const i = index.get(source);
       const j = index.get(target);
       if (i === undefined || j === undefined) return;
-      const ax = pos[i].x - pos[j].x;
-      const ay = pos[i].y - pos[j].y;
+      const ax = pos[j].x - pos[i].x;
+      const ay = pos[j].y - pos[i].y;
       const d = Math.hypot(ax, ay) || 0.01;
-      const f = (d * d) / k;
-      dx[i] -= (ax / d) * f; dy[i] -= (ay / d) * f;
-      dx[j] += (ax / d) * f; dy[j] += (ay / d) * f;
+      const f = (d - k) * SPRING_K;
+      fx[i] += (ax / d) * f; fy[i] += (ay / d) * f;
+      fx[j] -= (ax / d) * f; fy[j] -= (ay / d) * f;
     });
 
+    const maxSpeed = k * 0.6;
+    let energy = 0;
+
     for (let i = 0; i < nodes.length; i += 1) {
-      const len = Math.hypot(dx[i], dy[i]) || 1;
-      const capped = Math.min(len, temp);
-      let x = pos[i].x + (dx[i] / len) * capped;
-      let y = pos[i].y + (dy[i] / len) * capped;
-      x -= x * 0.012;            // weak gravity keeps components in frame
-      y -= y * 0.012;
-      g.setNodeAttribute(nodes[i], 'x', x);
-      g.setNodeAttribute(nodes[i], 'y', y);
+      const id = nodes[i];
+      if (id === this.dragged) continue;   // kinematically pinned, not force-driven
+
+      const v = this.velocity.get(id) || { vx: 0, vy: 0 };
+      let vx = (v.vx + fx[i]) * DAMPING;
+      let vy = (v.vy + fy[i]) * DAMPING;
+      const speed = Math.hypot(vx, vy);
+      if (speed > maxSpeed) { vx = (vx / speed) * maxSpeed; vy = (vy / speed) * maxSpeed; }
+
+      let x = pos[i].x + vx;
+      let y = pos[i].y + vy;
+      x -= x * GRAVITY;            // weak gravity keeps components in frame
+      y -= y * GRAVITY;
+
+      g.setNodeAttribute(id, 'x', x);
+      g.setNodeAttribute(id, 'y', y);
+      this.velocity.set(id, { vx, vy });
+      energy += vx * vx + vy * vy;
+    }
+
+    this.renderer.refresh();
+    this.awakeFrames += 1;
+
+    const settled = (energy / nodes.length) < SLEEP_ENERGY;
+    if (this.dragged || (!settled && this.awakeFrames < MAX_AWAKE_FRAMES)) {
+      this.raf = requestAnimationFrame(() => this.physicsTick());
+    } else {
+      this.raf = null;
+      if (this.pendingFit) {
+        this.pendingFit = false;
+        // Pull back slightly once settled: sigma fits node centres, which
+        // leaves labels on the outermost nodes clipped at the viewport edge.
+        this.renderer.getCamera().animate(
+          { x: 0.5, y: 0.5, ratio: 1.2 }, { duration: 320 },
+        );
+      }
     }
   }
 
   // ------------------------------------------------------------ selection
 
-  select(nodeId) {
-    this.selected = nodeId;
-    const panel = $('panel');
+  /*
+   * Tapping a node fetches its first- and second-order neighbourhood the
+   * first time (there is no separate "Expand" step) and shows it in the
+   * panel -- covering touch devices, which have no hover to drive showPanel.
+   * Already-fetched nodes just update the panel.
+   */
+  async activate(nodeId) {
+    if (!this.graph.hasNode(nodeId)) return;
+    this.showPanel(nodeId);
 
-    if (!nodeId || !this.graph.hasNode(nodeId)) {
-      panel.hidden = true;
-      this.graph.forEachNode((n) => this.graph.removeNodeAttribute(n, 'highlighted'));
-      this.renderer.refresh();
-      return;
+    if (this.expanded.has(nodeId)) return;
+    this.expanded.add(nodeId);
+    this.busy(true);
+    try {
+      const origin = this.graph.getNodeAttributes(nodeId);
+      const data = await this.api(`/api/expand?id=${encodeURIComponent(nodeId)}`);
+      const added = this.merge(data, origin);
+      if (added) this.wake();
+      // Connection counts in the panel may have grown from the fetch.
+      this.showPanel(nodeId);
+    } catch (err) {
+      this.expanded.delete(nodeId);
+      this.toast(err.message);
+    } finally {
+      this.busy(false);
     }
+  }
 
+  // Ring highlight tracks true hover (or an active drag), independent of
+  // which node the panel is currently showing.
+  setHighlight(nodeId) {
+    this.graph.forEachNode((n) => this.graph.setNodeAttribute(n, 'highlighted', n === nodeId));
+    this.renderer.refresh();
+  }
+
+  /*
+   * The panel is a constant fixture -- it never hides -- and always shows
+   * whichever node was hovered or tapped most recently, so this only ever
+   * replaces its content, never its visibility.
+   */
+  showPanel(nodeId) {
     const a = this.graph.getNodeAttributes(nodeId);
     $('panel-kind').textContent = a.kind;
     $('panel-kind').style.background = COLOURS[a.kind] || COLOURS.Unknown;
@@ -337,17 +720,18 @@ class Viewer {
     $('panel-meta').innerHTML = rows
       .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
     $('panel-profile').textContent = a.profile || '';
-    $('panel-expand').hidden = this.expanded.has(nodeId);
-    panel.hidden = false;
-
-    this.graph.forEachNode((n) => this.graph.setNodeAttribute(n, 'highlighted', n === nodeId));
-    this.renderer.refresh();
   }
 
   clear() {
-    this.graph.clear();
-    this.expanded.clear();
-    this.select(null);
+    this.beginNewGraph();
+    this.dragged = null;
+    if (this.raf) { cancelAnimationFrame(this.raf); this.raf = null; }
+    this.hideSuggestions();
+    $('panel-kind').textContent = '';
+    $('panel-kind').style.background = 'transparent';
+    $('panel-title').textContent = 'Hover a node';
+    $('panel-meta').innerHTML = '';
+    $('panel-profile').textContent = 'Tap or hover any node to see its details here.';
     $('q').value = '';
     $('hint').hidden = false;
     this.renderer.refresh();

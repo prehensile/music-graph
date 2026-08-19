@@ -33,5 +33,8 @@ fetch() {
 
 echo "Vendoring browser libraries into $VENDOR_DIR"
 fetch "https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js" "graphology.umd.min.js"
-fetch "https://unpkg.com/sigma@2.4.0/build/sigma.min.js"               "sigma.min.js"
+# sigma 3's UMD bundle moved from build/ to dist/, and bundles createNodeBorderProgram
+# (formerly the separate @sigma/node-border package, which needs a bundler -- it has
+# no UMD build of its own) directly into window.Sigma.rendering -- see app.js.
+fetch "https://unpkg.com/sigma@3.0.3/dist/sigma.min.js"                "sigma.min.js"
 echo "Done."

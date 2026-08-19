@@ -56,6 +56,13 @@ LOG_TAIL_BYTES = 64 * 1024
 LOG_TAIL_LINES = 200
 
 NODE_LABELS = ("Artist", "Group", "Release", "Label")
+# The four relationship types in the Data Model (see CLAUDE.md), ordered
+# rarest/structural first: a Group's few MEMBER_OF edges or a Label's few
+# SUBLABEL edges should never lose out to a node's own CREDITED or
+# RELEASED_ON edges, which run into the hundreds for a hub. _neighbours
+# spends a node's LIMIT budget through this list in order, so the front
+# always gets filled first and the back only gets whatever's left.
+REL_TYPES = ("MEMBER_OF", "SUBLABEL", "RELEASED_ON", "CREDITED")
 
 # Lucene reserved characters. The full-text index is the only place user text
 # reaches the database as anything other than a bound parameter, so the term is
@@ -72,6 +79,18 @@ def clean_term(raw):
 def clamp_limit(raw, default=60):
     try:
         return max(1, min(MAX_LIMIT, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Separate, smaller cap from MAX_LIMIT: a live-typing dropdown wants a handful
+# of top matches, not the couple hundred nodes a committed search expands to.
+SUGGEST_LIMIT_MAX = 15
+
+
+def clamp_suggest_limit(raw, default=8):
+    try:
+        return max(1, min(SUGGEST_LIMIT_MAX, int(raw)))
     except (TypeError, ValueError):
         return default
 
@@ -184,30 +203,170 @@ class Graph:
             return {"nodes": [], "edges": []}
         # Seeds come from the full-text index; a CONTAINS scan over millions of
         # nodes would not return in reasonable time.
+        seed_rows = self._run(
+            """
+            CALL db.index.fulltext.queryNodes($index, $term, {limit: $seeds})
+            YIELD node AS n
+            RETURN elementId(n) AS id
+            """,
+            index=SEARCH_INDEX, term=term, seeds=max(1, limit // 4),
+        )
+        return self._expand_two_hop([r["id"] for r in seed_rows], limit)
+
+    def suggest(self, term, limit):
+        """
+        Candidates for the live-search dropdown: just the top full-text
+        matches with enough descriptive text to tell them apart before
+        committing to a search -- an artist or group's own bio, a label's
+        bio (it already has one, same property), and for a release, the
+        artist(s), label(s) and year credited on it since a release has no
+        bio of its own. Deliberately not `_expand_two_hop` -- that's the
+        weight of a committed search, not every keystroke.
+        """
+        term = clean_term(term)
+        if not term:
+            return {"results": []}
+        rows = self._run(
+            """
+            CALL db.index.fulltext.queryNodes($index, $term, {limit: $limit})
+            YIELD node, score
+            OPTIONAL MATCH (node)<-[:CREDITED]-(artist)
+            OPTIONAL MATCH (node)-[:RELEASED_ON]->(label)
+            WITH node, score,
+                 collect(DISTINCT artist.name)[0..3] AS artists,
+                 collect(DISTINCT label.name)[0..2] AS labelNames
+            RETURN elementId(node) AS id, labels(node) AS nodeLabels,
+                   coalesce(node.name, node.title) AS title,
+                   node.year AS year,
+                   left(coalesce(node.profile, ''), 200) AS profile,
+                   artists, labelNames
+            ORDER BY score DESC
+            """,
+            index=SEARCH_INDEX, term=term, limit=limit,
+        )
+        results = []
+        for r in rows:
+            kind = next((l for l in (r["nodeLabels"] or []) if l in NODE_LABELS), "Unknown")
+            results.append({
+                "id": r["id"],
+                "kind": kind,
+                "title": r["title"] or "(untitled)",
+                "year": r["year"] or "",
+                "profile": r["profile"] or "",
+                "artists": [a for a in (r["artists"] or []) if a],
+                "labels": [l for l in (r["labelNames"] or []) if l],
+            })
+        return {"results": results}
+
+    def expand(self, element_id, limit):
+        return self._expand_two_hop([element_id], limit)
+
+    def _expand_two_hop(self, ids, limit):
+        """
+        First- and second-order neighbours of `ids`: whatever a user selects or
+        searches for should arrive with enough surrounding graph to explore
+        without a second round trip per tap. Two separate LIMIT-ed queries
+        rather than one two-hop Cypher pattern, since a hop straight through a
+        hub node (e.g. "Various") would otherwise fan out combinatorially
+        before LIMIT ever got a chance to apply.
+        """
+        if not ids:
+            return {"nodes": [], "edges": []}
+        hop1 = self._neighbours(ids, limit)
+        hop2 = self._neighbours([n["id"] for n in hop1["nodes"]], limit)
+        merged = self._merge_payloads(hop1, hop2)
+        return self._cap_payload(merged, MAX_LIMIT)
+
+    def _neighbours(self, ids, limit):
+        """
+        A flat `LIMIT $limit` over `(n)-[r]-(m)` gives every relationship type
+        one shared budget, in whatever order Neo4j happens to enumerate them
+        -- for a prolific node that meant its hundreds of CREDITED edges
+        exhausted the limit before its handful of MEMBER_OF edges were ever
+        reached, so e.g. tapping a band's own node expanded it without ever
+        showing its members.
+
+        Fetched as a chain of per-type batches instead, in REL_TYPES'
+        rarest-first order, each spending only what's left of $limit after
+        the ones before it: MEMBER_OF and SUBLABEL fill up first and always
+        get in, CREDITED and RELEASED_ON only get whatever budget survives
+        them. A node's total is still exactly $limit -- unlike giving every
+        type its own full $limit, which would need `_cap_payload` to
+        routinely mop up the overshoot instead of only for its documented
+        role as a rare backstop.
+        """
+        stages = []
+        carried = []          # batch{i} names accumulated so far, passed through each WITH
+        remaining_expr = "$limit"
+        for i, rel_type in enumerate(REL_TYPES):
+            r, m, coll, batch, left = f"r{i}", f"m{i}", f"c{i}", f"batch{i}", f"left{i}"
+            pass_through = "".join(f"{name}, " for name in carried)
+            # OPTIONAL, not MATCH: a node with none of this type must still
+            # flow through to the remaining stages rather than dropping out.
+            stages.append(f"""
+                OPTIONAL MATCH (n)-[{r}:{rel_type}]-({m})
+                WITH n, {pass_through}{remaining_expr} AS budget{i},
+                     [x IN collect({{r: {r}, m: {m}}}) WHERE x.r IS NOT NULL] AS {coll}
+                WITH n, {pass_through}{coll}[0..budget{i}] AS {batch},
+                     budget{i} - size({coll}[0..budget{i}]) AS {left}
+            """)
+            carried.append(batch)
+            remaining_expr = left
+        rows_expr = " + ".join(carried)
+
+        # Relationship type names come from the fixed REL_TYPES constant,
+        # never from user input, so interpolating them into the query text
+        # is safe.
         rows = self._run(
             f"""
-            CALL db.index.fulltext.queryNodes($index, $term, {{limit: $seeds}})
-            YIELD node AS n
-            OPTIONAL MATCH (n)-[r]-(m)
+            UNWIND $ids AS id
+            MATCH (n) WHERE elementId(n) = id
+            CALL {{
+                WITH n
+                {"".join(stages)}
+                WITH n, {rows_expr} AS rows
+                UNWIND (CASE WHEN size(rows) = 0 THEN [{{r: null, m: null}}] ELSE rows END) AS row
+                RETURN row.r AS r, row.m AS m
+            }}
             RETURN n, r, m
-            LIMIT $limit
             """,
-            index=SEARCH_INDEX, term=term,
-            seeds=max(1, limit // 4), limit=limit,
+            ids=ids, limit=limit,
         )
         return self._payload(rows)
 
-    def expand(self, element_id, limit):
-        rows = self._run(
-            """
-            MATCH (n) WHERE elementId(n) = $id
-            OPTIONAL MATCH (n)-[r]-(m)
-            RETURN n, r, m
-            LIMIT $limit
-            """,
-            id=element_id, limit=limit,
-        )
-        return self._payload(rows)
+    @staticmethod
+    def _merge_payloads(*payloads):
+        nodes, edges = {}, {}
+        for payload in payloads:
+            for n in payload["nodes"]:
+                nodes.setdefault(n["id"], n)
+            for e in payload["edges"]:
+                edges.setdefault(e["id"], e)
+        # Degree within the merged (two-hop) set, not either hop on its own.
+        for n in nodes.values():
+            n["degree"] = 0
+        for e in edges.values():
+            for end in ("source", "target"):
+                if e[end] in nodes:
+                    nodes[e[end]]["degree"] += 1
+        return {"nodes": list(nodes.values()), "edges": list(edges.values())}
+
+    @staticmethod
+    def _cap_payload(payload, cap):
+        """
+        Safety net, not the normal path: two independently-LIMIT-ed hops can
+        together exceed `cap` even though each stayed within `limit`. The
+        client's O(n^2) layout is built for a few hundred nodes, so trim
+        rather than hand it more.
+        """
+        if len(payload["nodes"]) <= cap:
+            return payload
+        keep = {n["id"] for n in payload["nodes"][:cap]}
+        return {
+            "nodes": [n for n in payload["nodes"] if n["id"] in keep],
+            "edges": [e for e in payload["edges"]
+                      if e["source"] in keep and e["target"] in keep],
+        }
 
     def _payload(self, rows):
         """Flatten (n, r, m) rows into a node/edge payload for the client."""
@@ -326,6 +485,11 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(self.graph.search(
                     query.get("q", [""])[0],
                     clamp_limit(query.get("limit", [None])[0]),
+                ))
+            elif parsed.path == "/api/suggest":
+                self._send_json(self.graph.suggest(
+                    query.get("q", [""])[0],
+                    clamp_suggest_limit(query.get("limit", [None])[0]),
                 ))
             elif parsed.path == "/api/expand":
                 node_id = query.get("id", [""])[0]
