@@ -151,7 +151,7 @@ const PHYSICS = { ...DEFAULT_PHYSICS };
 // range/step, and how many decimals are worth showing. Order here is
 // display order.
 const PHYSICS_PARAMS = [
-  { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 800, step: 5, decimals: 0 },
+  { key: 'REPULSE_K', label: 'Repulsion', min: 20, max: 1000, step: 5, decimals: 0 },
   { key: 'SIZE_REPULSE_PAD', label: 'Repulsion floor', min: 1, max: 3, step: 0.05, decimals: 2 },
   { key: 'SPRING_K', label: 'Spring strength', min: 0.005, max: 0.15, step: 0.005, decimals: 3 },
   { key: 'DAMPING', label: 'Damping', min: 0.5, max: 0.95, step: 0.01, decimals: 2 },
@@ -401,6 +401,24 @@ class Viewer {
       labelRenderedSizeThreshold: 9,
       minCameraRatio: 0.05,
       maxCameraRatio: 12,
+      // Sigma's default (`itemSizesReference: 'screen'`) keeps a node's
+      // rendered radius roughly fixed in actual screen pixels regardless of
+      // zoom -- position scales with the camera, size doesn't. physicsTick
+      // has never worked that way: it computes repulsion/collision purely
+      // in graph-space units, comparing `size` directly against x/y deltas
+      // as if they already lived in the same space (see SIZE_REPULSE_PAD,
+      // and the hard overlap-correction pass's `minSep`). Under the
+      // default reference those two notions of "size" only coincide by
+      // accident at whatever one camera ratio makes scaleSize(s) == s --
+      // at any other zoom (i.e. basically always, once the camera auto-
+      // fits to a real graph's bounding box), a pair the physics considers
+      // exactly non-overlapping can still be drawn overlapping on screen,
+      // which no amount of tuning REPULSE_K/collision iterations can fix
+      // because it's a unit mismatch, not a strength one. 'positions'
+      // makes size scale with the camera exactly like x/y do, so a
+      // graph-space non-overlap guarantee is a screen-space one too, at
+      // every zoom level.
+      itemSizesReference: 'positions',
       allowInvalidContainer: true,
       zIndex: true,
       nodeProgramClasses: { circle: nodeProgram },
