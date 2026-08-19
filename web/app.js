@@ -47,8 +47,13 @@ const AREA_SIDE = 820;
 // viewport. Two touching hubs (size ~26 each, mass 676) generate ~42x the
 // force two touching leaves (size ~4 each, mass 16) do at the same distance
 // -- hand-tuned so a typical mid-size pair feels roughly as strong as the
-// old k-anchored scheme did.
-const REPULSE_K = 45;
+// old k-anchored scheme did. Bumping REPULSE_K adds force proportional to
+// size_i * size_j, so the increase lands almost entirely on massy pairs
+// (hub-hub, hub-leaf) and barely touches leaf-leaf ones -- raised from 45
+// after hubs were still settling into knots, their springs (which pull
+// toward the count-derived `k`, blind to node size) out-muscling the
+// plateaued repulsion at close range.
+const REPULSE_K = 90;
 // How close (in drawn-radius units) a pair's repulsion is allowed to treat
 // them as being, at minimum -- below this, the force stops climbing toward
 // infinity as d -> 0 and plateaus instead. 0 would let coincident nodes
