@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>🪩 Discograph</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%F0%9F%8E%B5</text></svg>">
+<!-- Vendored locally by fetch_vendor.sh rather than loaded from a CDN, so the
+     page works on flaky mobile data and does not depend on unpkg being up. -->
+<script src="vendor/graphology.umd.min.js"></script>
+<script src="vendor/sigma.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>🪩 Discograph</h1>
+  <form id="search-form" autocomplete="off">
+    <div class="search-box">
+      <input type="search" id="q" placeholder="Search artists, releases, labels…"
+             aria-label="Search" enterkeyhint="search" autocomplete="off"
+             role="combobox" aria-expanded="false" aria-controls="suggestions" aria-autocomplete="list">
+      <ul id="suggestions" class="suggestions" role="listbox" hidden></ul>
+    </div>
+    <button type="submit" id="go">Search</button>
+  </form>
+</header>
+
+<main>
+  <div id="graph" role="application" aria-label="Graph view"></div>
+
+  <div id="hint" class="overlay">
+    <p>Search for an artist, release or label to begin.</p>
+    <p class="muted">Tap a node to pull in its neighbours.</p>
+  </div>
+
+  <div id="spinner" class="overlay" hidden><div class="dot"></div>Loading…</div>
+
+  <aside id="panel">
+    <span class="pill" id="panel-kind"></span>
+    <h2 id="panel-title">Hover a node</h2>
+    <dl id="panel-meta"></dl>
+    <p id="panel-profile">Tap or hover any node to see its details here.</p>
+    <a id="panel-link" class="panel-link" target="_blank" rel="noopener noreferrer" hidden>View on Discogs ↗</a>
+  </aside>
+
+  <aside id="physics-panel" hidden>
+    <div class="physics-panel-head">
+      <h2>Physics</h2>
+      <button id="physics-close" class="linkish" aria-label="Close">✕</button>
+    </div>
+    <div id="physics-controls"></div>
+    <div class="physics-panel-actions">
+      <button id="physics-reset" class="linkish">Reset</button>
+      <button id="physics-copy" class="linkish">Copy values</button>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <ul id="legend"></ul>
+  <span id="counts" class="muted"></span>
+  <a href="/logs" class="linkish">Build log</a>
+  <button id="physics-toggle" class="linkish">Physics</button>
+  <button id="reset" class="linkish">Clear</button>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

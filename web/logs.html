@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>🪩 Discograph — build progress</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%F0%9F%8E%B5</text></svg>">
+<style>
+  main { overflow-y: auto; padding: 14px; }
+  #summary { margin: 0 0 4px; font-size: 17px; font-weight: 600; }
+  #status  { margin: 0 0 16px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+
+  #bar-outer {
+    height: 8px; margin-bottom: 18px; border-radius: 999px;
+    background: var(--edge); overflow: hidden;
+  }
+  #bar-inner {
+    height: 100%; width: 0; border-radius: 999px;
+    background: var(--accent); transition: width 0.4s ease;
+  }
+  #bar-inner.failed { background: #f87171; }
+
+  ol#steps { margin: 0 0 20px; padding: 0; list-style: none; }
+  ol#steps li {
+    display: flex; align-items: baseline; gap: 9px;
+    padding: 7px 0; border-bottom: 1px solid var(--edge); font-size: 14px;
+  }
+  ol#steps li:last-child { border-bottom: 0; }
+  .mark { width: 16px; flex: none; text-align: center; font-size: 13px; }
+  .s-done    .mark { color: #34d399; }
+  .s-running .mark { color: var(--accent); }
+  .s-failed  .mark { color: #f87171; }
+  .s-pending { color: var(--muted); }
+  .s-skipped { color: var(--muted); }
+  .s-skipped .mark { color: var(--muted); }
+  .s-running { color: var(--text); font-weight: 600; }
+  .s-failed  { color: #fca5a5; }
+  .elapsed { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase;
+       letter-spacing: 0.7px; color: var(--muted); }
+  pre#log {
+    margin: 0; padding: 12px; max-height: 46vh; overflow: auto;
+    background: #0d1526; border: 1px solid var(--edge); border-radius: var(--radius);
+    font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  footer a, footer label { color: var(--muted); font-size: 13px; }
+  #toggles { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Build&nbsp;progress</h1>
+  <a href="/" style="margin-left:auto;color:var(--accent);font-weight:600;text-decoration:none">Open viewer &rarr;</a>
+</header>
+
+<main>
+  <p id="summary">Loading…</p>
+  <p id="status"></p>
+  <div id="bar-outer"><div id="bar-inner"></div></div>
+  <ol id="steps"></ol>
+  <h2>Log</h2>
+  <pre id="log">…</pre>
+</main>
+
+<footer>
+  <span class="muted" id="updated"></span>
+  <span id="toggles">
+    <input type="checkbox" id="follow" checked>
+    <label for="follow">Follow log</label>
+  </span>
+</footer>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const MARKS = { done: '✓', running: '●', failed: '✗', skipped: '–', pending: '○' };
+
+function fmt(seconds) {
+  if (!seconds || seconds < 1) return '';
+  if (seconds < 60) return seconds + 's';
+  if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+  return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function render(p) {
+  const total = p.total || 0;
+  const pct = total ? Math.round((p.done / total) * 100) : 0;
+
+  if (p.failed)        $('summary').textContent = 'Failed — see the log below';
+  else if (p.finished) $('summary').textContent = 'Finished — the graph is ready';
+  else if (total)      $('summary').textContent = `Step ${p.done + 1} of ${total} — ${pct}% complete`;
+  else                 $('summary').textContent = 'Waiting for the build to start…';
+
+  $('status').textContent = p.status || '';
+  $('bar-inner').style.width = pct + '%';
+  $('bar-inner').classList.toggle('failed', !!p.failed);
+
+  // Steps not yet reached are absent from the file, so pad to the known total
+  // rather than letting the list grow as the run proceeds.
+  const rows = [];
+  for (let i = 1; i <= Math.max(total, p.steps.length); i += 1) {
+    const s = p.steps.find((x) => x.n === i);
+    const state = s ? s.state : 'pending';
+    const name = s ? s.name : '…';
+    const el = (state === 'done' || state === 'failed') ? fmt(s.elapsed) : '';
+    rows.push(`<li class="s-${state}"><span class="mark">${MARKS[state]}</span>`
+            + `<span>${esc(name)}</span><span class="elapsed">${el}</span></li>`);
+  }
+  $('steps').innerHTML = rows.join('');
+
+  const log = $('log');
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.textContent = (p.log || []).join('\n') || '(nothing logged yet)';
+  if ($('follow').checked && atBottom) log.scrollTop = log.scrollHeight;
+
+  $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  return p.finished || p.failed;
+}
+
+async function poll() {
+  let stop = false;
+  try {
+    const res = await fetch('/api/progress', { cache: 'no-store' });
+    if (res.ok) stop = render(await res.json());
+    else $('summary').textContent = 'Progress unavailable (HTTP ' + res.status + ')';
+  } catch (err) {
+    $('summary').textContent = 'Cannot reach the server — retrying…';
+  }
+  // Back off once there is nothing left to watch.
+  setTimeout(poll, stop ? 30000 : 4000);
+}
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Local credentials for the web viewer
+web/config.js
+
+# Discogs dumps, chunked XML, SQLite indexes and generated CSVs
+data/
+*.xml
+*.xml.gz
+*.xml.[0-9]*
+*.db
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+web/vendor/
