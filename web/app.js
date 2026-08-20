@@ -27,6 +27,7 @@ const REL_LABEL = {
   CREDITED:    'credited on',
   RELEASED_ON: 'released on',
   SUBLABEL:    'sublabel of',
+  ALIAS_OF:    'alias of',
 };
 
 // discogs.com's own URL path per kind -- Group has no separate URL space

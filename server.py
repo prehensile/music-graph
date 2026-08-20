@@ -64,13 +64,14 @@ NODE_LABELS = ("Artist", "Group", "Release", "Label")
 # "discogsId" so the panel can link out to the real Discogs page -- app.js's
 # discogsUrl() builds the actual URL, this is just which property to read.
 DISCOGS_ID_PROPERTY = {"Artist": "artistId", "Group": "groupId", "Release": "releaseId", "Label": "labelId"}
-# The four relationship types in the Data Model (see CLAUDE.md), ordered
-# rarest/structural first: a Group's few MEMBER_OF edges or a Label's few
-# SUBLABEL edges should never lose out to a node's own CREDITED or
-# RELEASED_ON edges, which run into the hundreds for a hub. _neighbours
-# spends a node's LIMIT budget through this list in order, so the front
-# always gets filled first and the back only gets whatever's left.
-REL_TYPES = ("MEMBER_OF", "SUBLABEL", "RELEASED_ON", "CREDITED")
+# The relationship types in the Data Model (see CLAUDE.md), ordered
+# rarest/structural first: a Group's few MEMBER_OF edges, a Label's few
+# SUBLABEL edges, or an artist's handful of ALIAS_OF edges should never lose
+# out to a node's own CREDITED or RELEASED_ON edges, which run into the
+# hundreds for a hub. _neighbours spends a node's LIMIT budget through this
+# list in order, so the front always gets filled first and the back only
+# gets whatever's left.
+REL_TYPES = ("MEMBER_OF", "SUBLABEL", "ALIAS_OF", "RELEASED_ON", "CREDITED")
 
 # Lucene reserved characters. The full-text index is the only place user text
 # reaches the database as anything other than a bound parameter, so the term is

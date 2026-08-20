@@ -15,6 +15,7 @@ DATABASE="${2:-discogs}"
 
 for f in artists.csv groups.csv labels.csv releases.csv \
          artist_group_links.csv artist_release_links.csv \
+         artist_alias_links.csv \
          label_sublabel_links.csv release_label_links.csv; do
     if [[ ! -f "$CSV_DIR/$f" ]]; then
         echo "Missing $CSV_DIR/$f -- run the transform steps first." >&2
@@ -51,6 +52,7 @@ neo4j-admin database import full "$DATABASE" \
     --nodes=Release="$CSV_DIR/releases.csv" \
     --relationships=MEMBER_OF="$CSV_DIR/artist_group_links.csv" \
     --relationships=CREDITED="$CSV_DIR/artist_release_links.csv" \
+    --relationships=ALIAS_OF="$CSV_DIR/artist_alias_links.csv" \
     --relationships=SUBLABEL="$CSV_DIR/label_sublabel_links.csv" \
     --relationships=RELEASED_ON="$CSV_DIR/release_label_links.csv" \
     --multiline-fields=true \
