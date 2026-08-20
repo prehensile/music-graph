@@ -244,6 +244,20 @@ const FADE_SNAP = 0.004;
 const EDGE_RGB = [148, 163, 184];
 const EDGE_ALPHA = 0.35;
 
+// ALIAS_OF edges (Discogs' "same act, different name" links -- see
+// CLAUDE.md's Data Model) render as a thick white stroke with a blue lane
+// down the middle, rather than the uniform translucent grey line every
+// other relationship gets, so this one relationship reads as visually
+// distinct at a glance instead of blending into the rest of the graph.
+// Full opacity, deliberately, unlike EDGE_ALPHA -- the point is to stand
+// out, not blend in. Drawn on the overlay canvas set up in initRenderer
+// (see drawAliasEdges) rather than as a WebGL edge colour: a single WebGL
+// draw call is one flat colour, so a two-tone stroke needs two overlapping
+// 2D-canvas paths, the same reasoning as the dashed incomplete-node ring.
+const ALIAS_STROKE_WIDTH = 5;
+const ALIAS_LANE_WIDTH = 2;
+const ALIAS_LANE_COLOR = COLOURS.Artist;
+
 // Node size grows fast with degree up to about SIZE_KNEE connections, then
 // flattens -- a hub with hundreds of connections should not dwarf everything
 // else, but the difference between 1 and 8 connections should be obvious.
@@ -491,14 +505,31 @@ class Viewer {
       beforeLayer: 'labels',
     });
     this.ringCtx = this.renderer.canvasContexts.incompleteRing;
+
+    // A third canvas layer, for the white-and-blue ALIAS_OF stroke (see
+    // drawAliasEdges) -- same "WebGL draw call is one flat colour" problem
+    // as the dashed ring above, not the dash problem itself. `beforeLayer:
+    // 'nodes'` places it directly after sigma's own edges/edgeLabels layers
+    // (renderEdgeLabels is off) and before nodes, i.e. exactly where the
+    // default WebGL edge line it replaces would have drawn -- underneath
+    // node circles, not on top of them.
+    this.renderer.createCanvasContext('aliasEdges', {
+      style: { pointerEvents: 'none' },
+      beforeLayer: 'nodes',
+    });
+    this.aliasCtx = this.renderer.canvasContexts.aliasEdges;
+
     // resize() sizes (and devicePixelRatio-scales) every layer's actual
     // canvas element -- but bails out immediately unless the container's
     // own size just changed, which it hasn't here. Called only from sigma's
-    // own constructor before this layer existed, our canvas would otherwise
-    // sit at the browser's default 300x150 backing store forever, i.e.
-    // never actually visible. `true` forces it through regardless.
+    // own constructor before these layers existed, our canvases would
+    // otherwise sit at the browser's default 300x150 backing store forever,
+    // i.e. never actually visible. `true` forces it through regardless.
     this.renderer.resize(true);
-    this.renderer.on('afterRender', () => this.drawIncompleteRings());
+    this.renderer.on('afterRender', () => {
+      this.drawIncompleteRings();
+      this.drawAliasEdges();
+    });
 
     // The info panel is a constant fixture, not a popup -- it always shows
     // the most recently hovered (or tapped) node, rather than opening and
@@ -1439,19 +1470,80 @@ class Viewer {
   }
 
   /*
+   * Whether an edge between `source` and `target` is exempt from the
+   * hover/legend fade -- touching the hovered node, or, while a legend key
+   * is rolled over (see initLegend), touching a node of that key's kind
+   * instead. Shared by reduceEdge and drawAliasEdges so the two-tone
+   * ALIAS_OF stroke fades in step with every other edge rather than having
+   * its own, easily-drifting copy of the same rule.
+   */
+  edgeFadeExempt(source, target) {
+    if (this.highlightKind) {
+      return this.graph.getNodeAttribute(source, 'kind') === this.highlightKind
+        || this.graph.getNodeAttribute(target, 'kind') === this.highlightKind;
+    }
+    return source === this.hoveredNode || target === this.hoveredNode;
+  }
+
+  /*
    * edgeReducer counterpart to reduceNode: every edge not touching the
    * hovered node tweens the same way; edges into/out of it are left alone.
+   *
+   * ALIAS_OF edges are hidden here unconditionally -- they're drawn
+   * instead on the overlay canvas set up in initRenderer (see
+   * drawAliasEdges), so the default single-colour WebGL line must never
+   * render underneath the two-tone stroke that replaces it.
    */
   reduceEdge(edge, data) {
+    if (data.type_ === 'ALIAS_OF') return { ...data, hidden: true };
     if (this.fadeCurrent <= 0) return data;
     const [source, target] = this.graph.extremities(edge);
-    if (this.highlightKind) {
-      const exempt = this.graph.getNodeAttribute(source, 'kind') === this.highlightKind
-        || this.graph.getNodeAttribute(target, 'kind') === this.highlightKind;
-      return exempt ? data : { ...data, color: edgeColorAt(this.fadeCurrent) };
-    }
-    if (source === this.hoveredNode || target === this.hoveredNode) return data;
-    return { ...data, color: edgeColorAt(this.fadeCurrent) };
+    return this.edgeFadeExempt(source, target) ? data : { ...data, color: edgeColorAt(this.fadeCurrent) };
+  }
+
+  /*
+   * Draws every ALIAS_OF edge -- Discogs' "same act, different name" link,
+   * see CLAUDE.md's Data Model -- as a thick white stroke with a blue lane
+   * down the middle, instead of the uniform translucent grey line every
+   * other relationship gets (drawn by sigma's own WebGL edge program,
+   * hidden for these edges in reduceEdge above). A single WebGL draw call
+   * is one flat colour, so a two-tone stroke needs two overlapping paths,
+   * which is what the 2D overlay canvas is for -- same reasoning as
+   * drawIncompleteRings' dashed ring, a different WebGL limitation with
+   * the same fix.
+   *
+   * getNodeDisplayData/framedGraphToViewport are the same calls
+   * drawIncompleteRings makes to go from a node's graph-space position to
+   * on-screen pixels, so the stroke's endpoints land exactly on the
+   * WebGL-drawn nodes it connects.
+   */
+  drawAliasEdges() {
+    const ctx = this.aliasCtx;
+    const { width, height } = this.renderer.getDimensions();
+    ctx.clearRect(0, 0, width, height);
+    ctx.lineCap = 'round';
+    this.graph.forEachEdge((edge, attrs, source, target) => {
+      if (attrs.type_ !== 'ALIAS_OF') return;
+      const sourceDisplay = this.renderer.getNodeDisplayData(source);
+      const targetDisplay = this.renderer.getNodeDisplayData(target);
+      if (!sourceDisplay || !targetDisplay) return; // culled -- off-screen or otherwise not drawn this frame
+      const from = this.renderer.framedGraphToViewport(sourceDisplay);
+      const to = this.renderer.framedGraphToViewport(targetDisplay);
+
+      const faded = this.fadeCurrent > 0 && !this.edgeFadeExempt(source, target);
+      const outer = faded ? lerpToBg(OUTLINE_COLOR, this.fadeCurrent) : OUTLINE_COLOR;
+      const inner = faded ? lerpToBg(ALIAS_LANE_COLOR, this.fadeCurrent) : ALIAS_LANE_COLOR;
+
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.strokeStyle = outer;
+      ctx.lineWidth = ALIAS_STROKE_WIDTH;
+      ctx.stroke();
+      ctx.strokeStyle = inner;
+      ctx.lineWidth = ALIAS_LANE_WIDTH;
+      ctx.stroke();
+    });
   }
 
   /*
