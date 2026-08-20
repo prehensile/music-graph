@@ -48,6 +48,39 @@ function discogsUrl(kind, discogsId) {
   return `https://www.discogs.com/${path}/${discogsId}`;
 }
 
+// Discogs profile text carries its own inline reference syntax -- a single
+// letter (a=artist, l=label, r=release, m=master) followed by either a bare
+// Discogs id or, introduced by '=', free text: [a371918], [l=Optimal Media
+// GmbH], [l=Fax +49-69/450464]. Explored directly against the live profile
+// text before writing this: across 200k profiles, a/l overwhelmingly use the
+// name form (a= ~184k, l= ~53k vs a<id> ~111k, l<id> ~41k) while r/m are
+// almost always the bare-id form (~1.9k/~2.7k vs a couple thousand each for
+// r=<id>/m=<id>, which despite the '=' still carry a numeric id, not a
+// name -- true free-text r=/m= turned up twice in 200k profiles). Uppercase
+// A=/L= show up too (a couple thousand between them), hence the
+// case-insensitive prefix. The id form is deliberately restricted to all
+// digits so it can't swallow unrelated bracketed asides that happen to
+// start with the same letter -- "[aka ...]", "[at]", "[aged 79]" -- which
+// have no digits-only or '='-led shape to match.
+const PROFILE_REF = /\[([aAlLrRmM])(?:(\d+)|=([^\[\]\n]{1,120}))\]/g;
+
+// Turns raw Discogs profile text into safe HTML, escaping everything and
+// then re-wrapping each reference token (see PROFILE_REF) in a clickable
+// span carrying what openRef needs to resolve it -- the letter as `kind`,
+// and whichever of id/name matched as `ref`. Both come from text esc()
+// already ran over, so they're already attribute-safe; the browser
+// HTML-decodes them back to the original text when openRef reads
+// el.dataset.ref. Every other bracketed aside in Discogs profile text --
+// [b]/[i]/[u]/[s] formatting, footnote markers, catalogue numbers -- has a
+// shape PROFILE_REF doesn't match, so it passes through untouched.
+function renderProfile(text) {
+  return esc(text || '').replace(PROFILE_REF, (whole, letter, id, name) => {
+    const kind = letter.toLowerCase();
+    const ref = id !== undefined ? id : name;
+    return `<span class="ref-link" data-kind="${kind}" data-ref="${ref}" role="link" tabindex="0">${whole}</span>`;
+  });
+}
+
 // Live search (see fetchSuggestions): wait this long after the last keystroke
 // before hitting /api/suggest, and don't bother firing below this many chars
 // -- both keep a fast typist from spamming the endpoint on every keystroke.
@@ -662,6 +695,24 @@ class Viewer {
     document.addEventListener('click', (e) => {
       if (!e.target.closest('.search-box')) this.hideSuggestions();
     });
+
+    // One delegated listener rather than re-binding per showPanel() call --
+    // panel-profile's own content is replaced wholesale on every hover, so
+    // anything attached to a span inside it would need re-attaching just as
+    // often. Enter/Space mirror a click so the links (role="link",
+    // tabindex="0" -- see renderProfile) work from the keyboard too, same
+    // as any other reference on the page.
+    const profileEl = $('panel-profile');
+    const openRefFromEvent = (e) => {
+      const link = e.target.closest('.ref-link');
+      if (!link) return;
+      e.preventDefault();
+      this.openRef(link.dataset.kind, link.dataset.ref);
+    };
+    profileEl.addEventListener('click', openRefFromEvent);
+    profileEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') openRefFromEvent(e);
+    });
   }
 
   // ------------------------------------------------------------- fetching
@@ -1157,6 +1208,35 @@ class Viewer {
   // ------------------------------------------------------------ selection
 
   /*
+   * Fetches a node's first- and second-order neighbourhood and merges it in,
+   * marking it expanded so a later call is a no-op -- the guts of "tap a
+   * node", factored out so both activate() (the node is already on screen)
+   * and openRef() below (a profile-link click resolves to a node that isn't
+   * on screen yet, and has to be merged in before it can be treated the
+   * same way) share one fetch instead of each growing their own copy.
+   * `origin` seeds where a newly-added node appears (see merge()) --
+   * whatever's already known about it, or null when there's nothing to seed
+   * from yet.
+   */
+  async expandNode(nodeId, origin) {
+    if (this.expanded.has(nodeId)) return false;
+    this.expanded.add(nodeId);
+    this.busy(true);
+    try {
+      const data = await this.api(`/api/expand?id=${encodeURIComponent(nodeId)}`);
+      const added = this.merge(data, origin);
+      if (added) this.wake();
+      return true;
+    } catch (err) {
+      this.expanded.delete(nodeId);
+      this.toast(err.message);
+      return false;
+    } finally {
+      this.busy(false);
+    }
+  }
+
+  /*
    * Tapping a node fetches its first- and second-order neighbourhood the
    * first time (there is no separate "Expand" step) and shows it in the
    * panel -- covering touch devices, which have no hover to drive showPanel.
@@ -1166,23 +1246,49 @@ class Viewer {
     if (!this.graph.hasNode(nodeId)) return;
     this.stickPanel(nodeId);
     this.showPanel(nodeId);
+    // Connection counts in the panel may have grown from the fetch.
+    if (await this.expandNode(nodeId, this.graph.getNodeAttributes(nodeId))) {
+      this.showPanel(nodeId);
+    }
+  }
 
-    if (this.expanded.has(nodeId)) return;
-    this.expanded.add(nodeId);
+  /*
+   * Handles a click on an inline profile-text reference (see renderProfile
+   * and PROFILE_REF): resolves the bracketed token to a real node via
+   * /api/resolve, then treats it exactly like tapping that node -- merged
+   * into whatever graph is already on screen (never a fresh search, so
+   * beginNewGraph plays no part here), expanded, and shown in the panel.
+   *
+   * "m" (master) is handled without ever calling the server: no Master node
+   * exists to resolve to (see CLAUDE.md), so a numeric master reference
+   * just opens the real discogs.com page in a new tab instead. The other
+   * three kinds fail to resolve too, routinely -- most of all for "r"
+   * (release), since only a master's own main_release was ever imported --
+   * and get the same external-link fallback rather than a dead end: the
+   * real discogs.com page when the token carried a usable id, otherwise a
+   * toast, since free text with nothing to link to has no fallback URL to
+   * offer either.
+   */
+  async openRef(kind, ref) {
+    if (kind === 'm') {
+      if (/^\d+$/.test(ref)) window.open(`https://www.discogs.com/master/${ref}`, '_blank', 'noopener');
+      return;
+    }
+    const fallbackKind = { a: 'Artist', l: 'Label', r: 'Release' }[kind];
+    let resolved;
     this.busy(true);
     try {
-      const origin = this.graph.getNodeAttributes(nodeId);
-      const data = await this.api(`/api/expand?id=${encodeURIComponent(nodeId)}`);
-      const added = this.merge(data, origin);
-      if (added) this.wake();
-      // Connection counts in the panel may have grown from the fetch.
-      this.showPanel(nodeId);
+      resolved = await this.api(`/api/resolve?kind=${kind}&ref=${encodeURIComponent(ref)}`);
     } catch (err) {
-      this.expanded.delete(nodeId);
-      this.toast(err.message);
+      const url = /^\d+$/.test(ref) ? discogsUrl(fallbackKind, ref) : null;
+      if (url) window.open(url, '_blank', 'noopener');
+      else this.toast(`Couldn't find "${ref}" in the graph`);
+      return;
     } finally {
       this.busy(false);
     }
+    if (!this.graph.hasNode(resolved.id)) await this.expandNode(resolved.id, null);
+    return this.activate(resolved.id);
   }
 
   // Ring highlight tracks true hover (or an active drag), independent of
@@ -1388,7 +1494,11 @@ class Viewer {
 
     $('panel-meta').innerHTML = rows
       .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
-    $('panel-profile').textContent = a.profile || '';
+    // renderProfile turns the [a123]/[l=Name]/etc. reference tokens Discogs
+    // profile text carries into clickable spans -- see PROFILE_REF and the
+    // panel-profile click handler in bindEvents, which is what actually
+    // acts on them.
+    $('panel-profile').innerHTML = renderProfile(a.profile);
 
     // null for a node type discogs.com has no page for, or one missing its
     // own id -- hide the link rather than send someone to a broken URL.

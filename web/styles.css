@@ -293,6 +293,20 @@ main {
   overflow-wrap: anywhere;
 }
 
+/* Inline [a123]/[l=Name]/etc. references, linkified by renderProfile --
+   see app.js's PROFILE_REF and the panel-profile click handler. */
+.ref-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.ref-link:hover, .ref-link:focus-visible {
+  text-decoration-style: solid;
+  outline: none;
+}
+
 .panel-link {
   display: inline-block;
   font-size: 13px;

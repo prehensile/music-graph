@@ -122,6 +122,21 @@ SUGGEST_POOL_MAX = 60
 # nudge ahead by a fraction.
 NEIGHBOUR_TERM_BOOST = 6.0
 
+# Which node label(s) a profile-text reference token can resolve to, keyed by
+# its single-letter prefix -- see Graph.resolve_ref and app.js's PROFILE_REF.
+# "a" covers both Artist and Group because Discogs issues both kinds of
+# reference from the one artist id space (see the Data Model in CLAUDE.md),
+# and a bracketed [a123456] in someone's profile text has no way to say
+# which it means. "m" (master) is deliberately absent: masters are never
+# written out as nodes (see CLAUDE.md), so no reference token can ever
+# resolve one -- app.js handles that case entirely client-side, by linking
+# straight out to discogs.com instead of calling this API at all.
+REF_KIND_LABELS = {"a": ("Artist", "Group"), "l": ("Label",), "r": ("Release",)}
+# The free-text form of a reference ([a=Name], [l=Name], the rare
+# [r=Title]) names the property to match by name against -- Release has no
+# "name", only "title".
+REF_KIND_NAME_PROP = {"a": "name", "l": "name", "r": "title"}
+
 
 def tail_lines(path, max_bytes=LOG_TAIL_BYTES, max_lines=LOG_TAIL_LINES):
     """Last lines of a file, without reading the whole thing into memory."""
@@ -315,6 +330,58 @@ class Graph:
             })
         matches.sort(key=lambda m: m["score"], reverse=True)
         return matches[:limit]
+
+    def resolve_ref(self, kind, ref):
+        """
+        Resolve one inline profile-text reference -- [a123456], [l=Optimal
+        Media GmbH], the rare [r=Title] -- to a node already in the graph,
+        for app.js's click-a-profile-link feature. `kind` is the token's
+        single-letter prefix, lowercased; `ref` is whatever came after it,
+        either a bare Discogs id or (with the '=' form) free text.
+
+        A numeric ref is looked up by the id property REF_KIND_LABELS' node
+        label(s) actually carry (see DISCOGS_ID_PROPERTY), tried in order --
+        "a" tries Artist then Group, since the token alone can't say which.
+        Free text is matched by exact name/title first, then -- since it's
+        text someone typed by hand, not guaranteed to match verbatim -- by
+        the same full-text ranking `search`/`suggest` use, taking the top
+        candidate of the right kind(s). None if nothing matches, which is
+        the common case for a release reference (only a master's own
+        main_release is ever imported, see CLAUDE.md) and always the case
+        for a name that matches nothing at all.
+        """
+        labels = REF_KIND_LABELS.get(kind)
+        ref = (ref or "").strip()[:200]
+        if not labels or not ref:
+            return None
+
+        if ref.isdigit():
+            for label in labels:
+                prop = DISCOGS_ID_PROPERTY[label]
+                rows = self._run(
+                    f"MATCH (n:{label}) WHERE n.{prop} = $ref RETURN elementId(n) AS id LIMIT 1",
+                    ref=ref,
+                )
+                if rows:
+                    return rows[0]["id"]
+            return None
+
+        name_prop = REF_KIND_NAME_PROP[kind]
+        label_match = " OR ".join(f"n:{l}" for l in labels)
+        rows = self._run(
+            f"""
+            MATCH (n) WHERE ({label_match}) AND toLower(n.{name_prop}) = toLower($ref)
+            RETURN elementId(n) AS id LIMIT 1
+            """,
+            ref=ref,
+        )
+        if rows:
+            return rows[0]["id"]
+
+        for m in self._rank_matches(ref, 5, SUGGEST_POOL_MAX):
+            if m["kind"] in labels:
+                return m["id"]
+        return None
 
     def expand(self, element_id, limit):
         return self._expand_two_hop([element_id], limit)
@@ -584,6 +651,15 @@ class Handler(SimpleHTTPRequestHandler):
                     self._send_json(self.graph.expand(
                         node_id, clamp_limit(query.get("limit", [None])[0]),
                     ))
+            elif parsed.path == "/api/resolve":
+                node_id = self.graph.resolve_ref(
+                    query.get("kind", [""])[0].strip().lower(),
+                    query.get("ref", [""])[0],
+                )
+                if node_id is None:
+                    self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                else:
+                    self._send_json({"id": node_id})
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
