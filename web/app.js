@@ -64,22 +64,14 @@ function discogsUrl(kind, discogsId) {
 // have no digits-only or '='-led shape to match.
 const PROFILE_REF = /\[([aAlLrRmM])(?:(\d+)|=([^\[\]\n]{1,120}))\]/g;
 
-// Turns raw Discogs profile text into safe HTML, escaping everything and
-// then re-wrapping each reference token (see PROFILE_REF) in a clickable
-// span carrying what openRef needs to resolve it -- the letter as `kind`,
-// and whichever of id/name matched as `ref`. Both come from text esc()
-// already ran over, so they're already attribute-safe; the browser
-// HTML-decodes them back to the original text when openRef reads
-// el.dataset.ref. Every other bracketed aside in Discogs profile text --
-// [b]/[i]/[u]/[s] formatting, footnote markers, catalogue numbers -- has a
-// shape PROFILE_REF doesn't match, so it passes through untouched.
-function renderProfile(text) {
-  return esc(text || '').replace(PROFILE_REF, (whole, letter, id, name) => {
-    const kind = letter.toLowerCase();
-    const ref = id !== undefined ? id : name;
-    return `<span class="ref-link" data-kind="${kind}" data-ref="${ref}" role="link" tabindex="0">${whole}</span>`;
-  });
-}
+// How long a hover has to settle on a node before its profile's bare-id
+// reference tokens ([a123456], not [a=Name]) get resolved to a display
+// name -- see Viewer.resolveProfileRefNames. Without this, sweeping the
+// pointer across a run of nodes would fire a burst of /api/resolve calls
+// per node passed over, almost all abandoned before a response ever came
+// back. Named-reference tokens need no such debounce -- their display text
+// is already sitting right there in the token, nothing to fetch.
+const REF_NAME_DEBOUNCE_MS = 220;
 
 // Live search (see fetchSuggestions): wait this long after the last keystroke
 // before hitting /api/suggest, and don't bother firing below this many chars
@@ -395,6 +387,15 @@ class Viewer {
     // stickPanel/showPanel.
     this.stickyNode = null;
     this.stickyTimer = null;
+
+    // Profile-text reference links (see renderProfile/openRef): resolved
+    // node info, keyed "kind:ref" so a bare-id token and a name token never
+    // collide even if their text happens to match. Populated by both the
+    // hover-driven resolveProfileRefNames (display name) and openRef (a
+    // click), whichever happens first -- letting the other skip a repeat
+    // fetch for the same reference, on the same node or a different one.
+    this.refNameCache = new Map();
+    this.refNameTimer = null;
 
     this.initRenderer();
     this.initLegend();
@@ -1253,6 +1254,72 @@ class Viewer {
   }
 
   /*
+   * Turns raw Discogs profile text into safe HTML, escaping everything and
+   * then re-wrapping each reference token (see PROFILE_REF) in a clickable
+   * span -- showing the *linked node's name*, not the raw markup, per the
+   * whole point of this feature. A named token ([a=Name]/[l=Name], the rare
+   * [r=Title]) already carries its display text right there in the token;
+   * a bare-id token ([a123456]) doesn't, so it falls back to whatever's
+   * cached from an earlier resolve (see refNameCache) or, failing that, the
+   * bare id itself as a placeholder -- data-pending marks it so
+   * resolveProfileRefNames knows to go fetch the real name. Every other
+   * bracketed aside in Discogs profile text -- [b]/[i]/[u]/[s] formatting,
+   * footnote markers, catalogue numbers -- has a shape PROFILE_REF doesn't
+   * match, so it passes through untouched.
+   */
+  renderProfile(text) {
+    return esc(text || '').replace(PROFILE_REF, (whole, letter, id, name) => {
+      const kind = letter.toLowerCase();
+      const ref = id !== undefined ? id : name;
+      if (id === undefined) {
+        return `<span class="ref-link" data-kind="${kind}" data-ref="${ref}" role="link" tabindex="0">${ref}</span>`;
+      }
+      const cached = this.refNameCache.get(`${kind}:${ref}`);
+      const shown = cached ? esc(cached.title || ref) : ref;
+      const pending = cached ? '' : ' data-pending="1"';
+      return `<span class="ref-link" data-kind="${kind}" data-ref="${ref}"${pending} role="link" tabindex="0">${shown}</span>`;
+    });
+  }
+
+  /*
+   * Resolves the display name for every not-yet-cached bare-id reference
+   * span left behind by renderProfile (marked data-pending) -- everything
+   * else already has its real text and nothing to fetch. Debounced by
+   * REF_NAME_DEBOUNCE_MS (see its own comment) rather than firing
+   * immediately: showPanel calls this on every hover, not just a tap, so
+   * without a settle delay a pointer sweeping across several nodes in a row
+   * would fire a burst of requests for panels no longer even on screen by
+   * the time they answered.
+   *
+   * "m" (master) spans are marked pending like any other bare-id token but
+   * never actually fetched -- no Master node exists to resolve one to (see
+   * CLAUDE.md) -- so they settle for showing the bare id once
+   * data-pending is cleared, same as an ordinary resolve failure below.
+   */
+  resolveProfileRefNames() {
+    clearTimeout(this.refNameTimer);
+    const pending = Array.from($('panel-profile').querySelectorAll('.ref-link[data-pending]'));
+    if (!pending.length) return;
+    this.refNameTimer = setTimeout(() => {
+      pending.forEach((el) => {
+        const { kind, ref } = el.dataset;
+        if (kind === 'm') { el.removeAttribute('data-pending'); return; }
+        this.api(`/api/resolve?kind=${kind}&ref=${encodeURIComponent(ref)}`)
+          .then((resolved) => {
+            this.refNameCache.set(`${kind}:${ref}`, resolved);
+            el.textContent = resolved.title || ref;
+            el.removeAttribute('data-pending');
+          })
+          // Resolve failure (not found, network hiccup) -- leave the bare id
+          // showing rather than an empty or stuck-loading span; el is
+          // possibly detached by now (the panel moved on) but writing to it
+          // is harmless either way.
+          .catch(() => el.removeAttribute('data-pending'));
+      });
+    }, REF_NAME_DEBOUNCE_MS);
+  }
+
+  /*
    * Handles a click on an inline profile-text reference (see renderProfile
    * and PROFILE_REF): resolves the bracketed token to a real node via
    * /api/resolve, then treats it exactly like tapping that node -- merged
@@ -1275,17 +1342,23 @@ class Viewer {
       return;
     }
     const fallbackKind = { a: 'Artist', l: 'Label', r: 'Release' }[kind];
-    let resolved;
-    this.busy(true);
-    try {
-      resolved = await this.api(`/api/resolve?kind=${kind}&ref=${encodeURIComponent(ref)}`);
-    } catch (err) {
-      const url = /^\d+$/.test(ref) ? discogsUrl(fallbackKind, ref) : null;
-      if (url) window.open(url, '_blank', 'noopener');
-      else this.toast(`Couldn't find "${ref}" in the graph`);
-      return;
-    } finally {
-      this.busy(false);
+    // resolveProfileRefNames (or an earlier click) may already have
+    // resolved this exact reference -- reuse it rather than a repeat fetch.
+    const cacheKey = `${kind}:${ref}`;
+    let resolved = this.refNameCache.get(cacheKey);
+    if (!resolved) {
+      this.busy(true);
+      try {
+        resolved = await this.api(`/api/resolve?kind=${kind}&ref=${encodeURIComponent(ref)}`);
+        this.refNameCache.set(cacheKey, resolved);
+      } catch (err) {
+        const url = /^\d+$/.test(ref) ? discogsUrl(fallbackKind, ref) : null;
+        if (url) window.open(url, '_blank', 'noopener');
+        else this.toast(`Couldn't find "${ref}" in the graph`);
+        return;
+      } finally {
+        this.busy(false);
+      }
     }
     if (!this.graph.hasNode(resolved.id)) await this.expandNode(resolved.id, null);
     return this.activate(resolved.id);
@@ -1495,10 +1568,14 @@ class Viewer {
     $('panel-meta').innerHTML = rows
       .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
     // renderProfile turns the [a123]/[l=Name]/etc. reference tokens Discogs
-    // profile text carries into clickable spans -- see PROFILE_REF and the
-    // panel-profile click handler in bindEvents, which is what actually
-    // acts on them.
-    $('panel-profile').innerHTML = renderProfile(a.profile);
+    // profile text carries into clickable spans showing the linked node's
+    // name, not the raw markup -- see PROFILE_REF and the panel-profile
+    // click handler in bindEvents, which is what acts on a click.
+    // resolveProfileRefNames fills in the display name for whichever of
+    // those spans don't already have one (see its own comment for why some
+    // do and some don't).
+    $('panel-profile').innerHTML = this.renderProfile(a.profile);
+    this.resolveProfileRefNames();
 
     // null for a node type discogs.com has no page for, or one missing its
     // own id -- hide the link rather than send someone to a broken URL.

@@ -307,6 +307,10 @@ main {
   outline: none;
 }
 
+/* A bare-id reference ([a123456]) showing its placeholder id while
+   resolveProfileRefNames fetches the real name -- see app.js. */
+.ref-link[data-pending] { opacity: 0.6; }
+
 .panel-link {
   display: inline-block;
   font-size: 13px;

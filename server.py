@@ -339,6 +339,12 @@ class Graph:
         single-letter prefix, lowercased; `ref` is whatever came after it,
         either a bare Discogs id or (with the '=' form) free text.
 
+        Returns the node's own display name/title alongside its id and
+        label, not just the id: a bare-id token ([a123456]) carries no name
+        of its own for app.js's renderProfile to show as link text, so it
+        has to come from here -- the whole reason this returns more than
+        the id, unlike a plain existence check would.
+
         A numeric ref is looked up by the id property REF_KIND_LABELS' node
         label(s) actually carry (see DISCOGS_ID_PROPERTY), tried in order --
         "a" tries Artist then Group, since the token alone can't say which.
@@ -359,11 +365,14 @@ class Graph:
             for label in labels:
                 prop = DISCOGS_ID_PROPERTY[label]
                 rows = self._run(
-                    f"MATCH (n:{label}) WHERE n.{prop} = $ref RETURN elementId(n) AS id LIMIT 1",
+                    f"""
+                    MATCH (n:{label}) WHERE n.{prop} = $ref
+                    RETURN elementId(n) AS id, coalesce(n.name, n.title) AS title LIMIT 1
+                    """,
                     ref=ref,
                 )
                 if rows:
-                    return rows[0]["id"]
+                    return {"id": rows[0]["id"], "kind": label, "title": rows[0]["title"]}
             return None
 
         name_prop = REF_KIND_NAME_PROP[kind]
@@ -371,16 +380,18 @@ class Graph:
         rows = self._run(
             f"""
             MATCH (n) WHERE ({label_match}) AND toLower(n.{name_prop}) = toLower($ref)
-            RETURN elementId(n) AS id LIMIT 1
+            RETURN elementId(n) AS id, labels(n) AS nodeLabels,
+                   coalesce(n.name, n.title) AS title LIMIT 1
             """,
             ref=ref,
         )
         if rows:
-            return rows[0]["id"]
+            found_kind = next((l for l in rows[0]["nodeLabels"] if l in labels), labels[0])
+            return {"id": rows[0]["id"], "kind": found_kind, "title": rows[0]["title"]}
 
         for m in self._rank_matches(ref, 5, SUGGEST_POOL_MAX):
             if m["kind"] in labels:
-                return m["id"]
+                return {"id": m["id"], "kind": m["kind"], "title": m["title"]}
         return None
 
     def expand(self, element_id, limit):
@@ -652,14 +663,14 @@ class Handler(SimpleHTTPRequestHandler):
                         node_id, clamp_limit(query.get("limit", [None])[0]),
                     ))
             elif parsed.path == "/api/resolve":
-                node_id = self.graph.resolve_ref(
+                resolved = self.graph.resolve_ref(
                     query.get("kind", [""])[0].strip().lower(),
                     query.get("ref", [""])[0],
                 )
-                if node_id is None:
+                if resolved is None:
                     self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 else:
-                    self._send_json({"id": node_id})
+                    self._send_json(resolved)
             else:
                 self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
