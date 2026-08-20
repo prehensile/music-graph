@@ -66,6 +66,16 @@ def init_csv_writers( out_dir, xml_files, write_releases=False ):
             [":START_ID(Entity)", ":END_ID(Entity)"]
         )
 
+        # Also Entity, not Artist: an alias pair can be two people, two group
+        # names for the same act, or a person and a group name (Jah Wobble /
+        # John Wardle is the person case). Undirected in practice -- see
+        # process_artist for how each pair is written only once even though
+        # Discogs records it on both sides.
+        writers["artist_alias_links"] = open_writer(
+            f"{out_dir}/artist_alias_links.csv",
+            [":START_ID(Entity)", ":END_ID(Entity)"]
+        )
+
 
     # Masters are an intermediate hop, not a node: they are resolved to their
     # main_release and written out as Release rows. See process_master().
@@ -189,7 +199,28 @@ def process_label( element: Element, writers, xml_files, sqlite_files ):
                   safe_text( element, "name" ), safe_text( element, "profile" ) )
 
 
-def process_artist(element: Element, writers):
+def iter_artist_aliases(element: Element):
+    """
+    Yield (self_id, alias_id) for each entry in this artist/group's <aliases>
+    block, exactly as declared -- not deduped, not canonically ordered.
+    Discogs writes aliases symmetrically (both records list each other, as
+    with <members>/<groups>), so a straight pass over every artist sees each
+    pair twice under normal circumstances. Callers that want each unordered
+    pair written once should dedupe on a canonical (min, max) key by *numeric*
+    id -- id strings are not zero-padded, so lexicographic ordering of "1000"
+    and "999" disagrees with numeric ordering.
+    """
+    aliases = element.find("aliases")
+    if aliases is None:
+        return
+    element_id = element.find("id").text
+    for name in aliases.findall("name"):
+        alias_id = name.attrib.get("id")
+        if alias_id:
+            yield element_id, alias_id
+
+
+def process_artist(element: Element, writers, seen_alias_pairs):
 
     try:
 
@@ -199,6 +230,13 @@ def process_artist(element: Element, writers):
         element_id = element.find("id").text
         element_name = safe_text( element, "name" )
         element_profile = safe_text( element, "profile" )
+
+        for self_id, alias_id in iter_artist_aliases( element ):
+            key = (self_id, alias_id) if int(self_id) < int(alias_id) \
+                else (alias_id, self_id)
+            if key not in seen_alias_pairs:
+                seen_alias_pairs.add( key )
+                writers["artist_alias_links"].writerow([ self_id, alias_id ])
 
         members = element.find("members")
         if members is not None:
@@ -472,8 +510,12 @@ def main(artist_xml, master_xml, label_xml, release_xml, release_sqlite, label_s
 
     if artist_xml:
         print(f"Processing artist from {artist_xml}")
+        # Shared across the whole pass so each alias pair is written once
+        # even though Discogs declares it on both records -- see
+        # iter_artist_aliases and process_artist.
+        seen_alias_pairs = set()
         stream_elements( artist_xml, "artist",
-            lambda e: process_artist( e, writers ) )
+            lambda e: process_artist( e, writers, seen_alias_pairs ) )
 
     if release_xml:
         # Preferred path: two streaming passes, no index, reads .gz directly.
