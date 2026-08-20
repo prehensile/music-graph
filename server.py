@@ -247,9 +247,11 @@ class Graph:
         if not term:
             return {"results": []}
         matches = self._rank_matches(term, limit, SUGGEST_POOL_MAX)
-        # `score` only exists to rank matches against each other; the client
-        # has no use for it.
-        return {"results": [{k: v for k, v in m.items() if k != "score"} for m in matches]}
+        # `score` and `degree` only exist to rank matches against each other;
+        # the client has no use for either.
+        return {"results": [
+            {k: v for k, v in m.items() if k not in ("score", "degree")} for m in matches
+        ]}
 
     def _rank_matches(self, term, limit, pool):
         """
@@ -272,6 +274,11 @@ class Graph:
         label carries it instead -- the same neighbour data `suggest` already
         wants for its descriptive text, so this costs one extra hop per
         candidate rather than a second round trip.
+
+        Ties on that score -- most often several candidates sharing the same
+        base full-text score and no neighbour boost -- are broken by node
+        degree, most-connected first, so a well-known/prominent match doesn't
+        lose a coin flip to an obscure one Lucene scored identically.
         """
         terms = [t for t in term.lower().split() if t]
         rows = self._run(
@@ -287,7 +294,8 @@ class Graph:
                    coalesce(node.name, node.title) AS title,
                    node.year AS year,
                    left(coalesce(node.profile, ''), 200) AS profile,
-                   score, artists, labelNames
+                   score, artists, labelNames,
+                   COUNT { (node)--() } AS degree
             """,
             index=SEARCH_INDEX, term=term, pool=pool,
         )
@@ -312,8 +320,9 @@ class Graph:
                 "artists": artists,
                 "labels": labels,
                 "score": (r["score"] or 0.0) + boost,
+                "degree": r["degree"] or 0,
             })
-        matches.sort(key=lambda m: m["score"], reverse=True)
+        matches.sort(key=lambda m: (m["score"], m["degree"]), reverse=True)
         return matches[:limit]
 
     def expand(self, element_id, limit):
