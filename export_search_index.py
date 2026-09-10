@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Export a flat (type, id, name) CSV straight from Neo4j, for building a static
-search index once the intermediate CSVs are gone.
+Export a flat (type, id, name, degree) CSV straight from Neo4j, for building
+a static search index once the intermediate CSVs are gone.
 
 Filed alongside notes/static-search-downsize-2026-08-19.md: the plan there
 needs id+name for every node, and the pipeline's own artists.csv/groups.csv/
@@ -30,6 +30,15 @@ memory stays flat regardless of node count. Rows with an empty or missing
 name are skipped -- they can never be searched for, and CLAUDE.md notes a
 small amount of referential drift in the graph, so a handful showing up here
 is expected, not a bug.
+
+`degree` is each node's total relationship count (`COUNT { (n)--() }`, same
+pattern used for hubs in graph_stats.py and for match ranking in server.py),
+carried along for step 2 of the note's next-steps: deciding what to trim from
+the index needs some measure of a node's prominence, and this is that measure
+without a second pass over the graph later. It costs a relationship scan per
+node at export time -- there is no shortcut via the count store for
+per-node degree, only label totals -- so this export is slower than a plain
+id+name pull would be.
 
 Environment matches server.py/graph_stats.py: NEO4J_URI, NEO4J_USERNAME,
 NEO4J_PASSWORD, NEO4J_DATABASE.
@@ -74,14 +83,17 @@ def export_label(session, label, writer):
     hb = Heartbeat(label.lower(), total=count(session, label), unit=label.lower())
     hb.begin()
     written = skipped = 0
-    result = session.run(f"MATCH (n:{label}) RETURN n.{id_prop} AS id, n.{name_prop} AS name")
+    result = session.run(
+        f"MATCH (n:{label}) RETURN n.{id_prop} AS id, n.{name_prop} AS name, "
+        f"COUNT {{ (n)--() }} AS degree"
+    )
     for record in result:  # streamed from the Bolt connection, not buffered
-        node_id, name = record["id"], record["name"]
+        node_id, name, degree = record["id"], record["name"], record["degree"]
         if not name or not name.strip():
             skipped += 1
             hb.tick(written + skipped)
             continue
-        writer.writerow((label, node_id, name))
+        writer.writerow((label, node_id, name, degree))
         written += 1
         hb.tick(written + skipped)
     hb.finish(f"{skipped:,} skipped (empty name)")
@@ -115,7 +127,7 @@ def main():
     try:
         with driver.session(database=database) as session, open_output(args.output) as fh:
             writer = csv.writer(fh)
-            writer.writerow(("type", "id", "name"))
+            writer.writerow(("type", "id", "name", "degree"))
             for label in labels:
                 written, skipped = export_label(session, label, writer)
                 total_written += written

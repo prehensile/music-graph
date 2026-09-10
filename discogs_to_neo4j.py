@@ -3,6 +3,7 @@
 import os
 import csv
 import gzip
+import re
 import time
 import traceback
 import click
@@ -23,6 +24,26 @@ import lxml.etree as et
 # node for them instead would be worse than dropping the edge: it would link
 # together thousands of releases that share nothing but an unknown performer.
 PLACEHOLDER_ARTIST_IDS = {"194", "355"}
+
+# The label-side equivalent of PLACEHOLDER_ARTIST_IDS, but not a fixed id
+# set: Discogs' convention for "this release has no real label" is the
+# canonical "Not On Label" (id 1818) plus one freshly-minted
+# "Not On Label (Artist Self-released)" id per self-released item, so
+# there is a different id for essentially every occurrence rather than one
+# or two reserved ones. Detected by name instead. Measured on the 2026-08
+# dump: 314,020 of 2,420,829 Label rows (13%) match this -- none of them a
+# real record label worth a node or a RELEASED_ON edge, so both are
+# skipped, same treatment PLACEHOLDER_ARTIST_IDS gives 194/355 for
+# CREDITED. Anchored at the start (not a bare substring search) so a real
+# label that merely mentions "not on label" in a longer name isn't caught;
+# case-insensitive because the dump has both "Not On Label" and the rarer
+# "Not on Label". Shared with migrate_remove_placeholder_labels.py so the
+# transform and the live-graph cleanup can't drift apart on the pattern.
+NOT_ON_LABEL_RE = re.compile(r"^\s*not on label\b", re.IGNORECASE)
+
+
+def is_placeholder_label(name):
+    return bool(name) and bool(NOT_ON_LABEL_RE.match(name))
 
 
 def open_writer( fn, header, write_header=True ):
@@ -145,8 +166,15 @@ def upsert_label( sqlite_files, writers, label_id, name, profile="" ):
     """
     Record a Label. The upsert keeps whichever sighting is richer, which is why
     labels stage through SQLite rather than being written straight to CSV.
+
+    Silently drops "Not On Label" placeholders (see is_placeholder_label) --
+    they are not a real label, so no node is worth creating for one. This is
+    the single choke point all three process_label branches (sublabel,
+    release-embedded ref, top-level labels.xml record) write through, so
+    gating here is enough to keep a placeholder-named Label out of the graph
+    regardless of which branch first sees it.
     """
-    if not label_id:
+    if not label_id or is_placeholder_label(name):
         return
     if sqlite_files["label"]:
         sqlite_files["label"].execute(
@@ -296,9 +324,13 @@ def process_release( element: Element, writers, xml_files, sqlite_files ):
         
         labels = element.find("labels")
         if labels is not None:
-            for label_elem in labels.findall("label"): 
+            for label_elem in labels.findall("label"):
                 label_id = label_elem.attrib.get("id")
-                if label_id is not None:
+                # "Not On Label (...)" isn't a real label -- treat the
+                # release as having none, i.e. write neither the Label node
+                # (upsert_label would drop it anyway) nor the RELEASED_ON
+                # edge, rather than linking it to a placeholder.
+                if label_id is not None and not is_placeholder_label(label_elem.attrib.get("name")):
                     process_label( label_elem, writers, xml_files, sqlite_files )
                     writers["release_label_links"].writerow([
                         release_id,

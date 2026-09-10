@@ -116,6 +116,15 @@ Two things make this safe against a live, populated database:
 
 An alias id may resolve to either an `Artist` or a `Group` node (same shared `Entity` space `MEMBER_OF` uses), which isn't knowable from the XML alone — the batch query looks both up with `OPTIONAL MATCH` and takes `coalesce()` of whichever side actually matched.
 
+`migrate_remove_placeholder_labels.py` is the same idea in the other direction — cleaning up data already imported, rather than adding a new relationship type. See "Not On Label" placeholders in the Data Model section for what it removes and why. Unlike `migrate_add_aliases.py`'s idempotent `MERGE`, this one `DETACH DELETE`s, so it defaults to a dry run (counts + a name sample, nothing touched) and needs `--execute` to actually delete:
+
+```bash
+python migrate_remove_placeholder_labels.py             # dry run
+python migrate_remove_placeholder_labels.py --execute    # deletes
+```
+
+It reads no XML — matching goes straight off each `Label` node's `name` property already in the graph, via the same `is_placeholder_label` function `discogs_to_neo4j.py` uses, imported rather than reimplemented so the two can't drift. **Reads and writes go through two separate driver sessions.** A single session only has one query result "in flight" at a time; interleaving a write into the middle of a still-open MATCH scan forces the driver to buffer the rest of that scan into memory before it can run the write. Found the hard way on the 2026-09-07 run against the downsized `s-2vcpu-4gb` droplet: RSS passed 1GB and progress stalled dead after exactly one batch had landed, on a box with well under that much free memory to begin with. Two sessions multiplex over separate connections, so the read keeps streaming while writes happen alongside it — the fix, and the reason this script opens `read_session`/`write_session` rather than one `session`.
+
 ## Why both SQLite and CSV
 
 These are not competing formats and neither replaced the other.
@@ -168,6 +177,8 @@ That makes the ID space the thing to get right, and the importer is the check on
 **Masters are an intermediate hop, not a node.** There is no `Master` label in the graph.
 
 **Two Discogs ids are placeholders, not artists, and are dropped from `CREDITED` entirely.** `194` is "Various" (a compilation credited as a whole) and `355` is "Unknown Artist". Neither has ever had its own artist page — confirmed absent from the artists dump, not merely dropped by a parsing bug — so every release crediting them would otherwise be a dangling edge. `PLACEHOLDER_ARTIST_IDS` in `discogs_to_neo4j.py` filters them out in `process_release` before the row is ever written. Writing a generic node for them instead would be worse than dropping the edge: it would link together thousands of unrelated releases that share nothing but an unknown or various performer.
+
+**"Not On Label" is the `Label` side of the same problem, but by name rather than id.** Discogs' convention for "this release has no real label" is the canonical `Label` named "Not On Label" (Discogs id 1818) plus one freshly-minted `"Not On Label (Artist Self-released)"` id per self-released item — a different id for essentially every occurrence, not one or two reserved ones, so `PLACEHOLDER_ARTIST_IDS`'s fixed-id-set trick doesn't apply. `is_placeholder_label` in `discogs_to_neo4j.py` matches by name instead (`^\s*not on label\b`, case-insensitive), and both `upsert_label` and `process_release`'s `RELEASED_ON` write are gated on it, so a placeholder gets neither a node nor an edge — the release is treated as having no label at all, same as `CREDITED` treats `194`/`355` as no artist. Measured on the 2026-08 dump: 313,957 of 2,420,829 `Label` rows (13%) matched, taking 136,439 `RELEASED_ON` edges and 20,691 `SUBLABEL` edges with them — the latter not real label hierarchy either, all against empty-named orphan nodes created by a malformed nested `<sublabels>` block some placeholder entries carry. `migrate_remove_placeholder_labels.py` (see [Migrating an existing database](#migrating-an-existing-database)) is the live-graph cleanup for a database imported before this filter existed.
 
 ## Running it on a droplet
 

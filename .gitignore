@@ -8,6 +8,10 @@ data/
 *.xml.[0-9]*
 *.db
 *.csv
+*.csv.gz
+
+# Generated static search index (export_search_index.py / shard_search_index.py)
+web/search-index/
 
 # Python
 __pycache__/
