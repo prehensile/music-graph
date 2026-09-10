@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>🔍 v2 search (test harness)</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>%F0%9F%94%8D</text></svg>">
+<style>
+  /*
+   * Deliberately self-contained: no link to /styles.css, no shared
+   * markup with index.html. This page and search.js exist to test the
+   * static sharded index in isolation, not to become part of the real
+   * viewer -- see notes/static-search-downsize-2026-08-19.md. Colours
+   * echo styles.css's palette for a familiar look, but nothing here
+   * actually depends on that file existing.
+   */
+  :root {
+    --bg: #0b1120;
+    --panel: #131c31;
+    --edge: #1e293b;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --hit: #34d399;
+    --miss: #f87171;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; min-height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  body { padding: 20px; max-width: 720px; margin: 0 auto; }
+
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.tagline { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  p.tagline code { color: var(--text); }
+
+  #manifest-line { margin: 0 0 16px; font-size: 12px; color: var(--muted); }
+  #manifest-line.error { color: var(--miss); }
+
+  input#q {
+    width: 100%; padding: 12px 14px; font-size: 16px;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: var(--radius);
+    color: var(--text); outline: none;
+  }
+  input#q:focus { border-color: var(--accent); }
+
+  h2 {
+    margin: 22px 0 8px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: 0.7px; color: var(--muted);
+  }
+
+  ul#results { list-style: none; margin: 0; padding: 0; }
+  ul#results li {
+    display: flex; align-items: baseline; gap: 10px; padding: 9px 10px;
+    border-bottom: 1px solid var(--edge); font-size: 14px;
+  }
+  ul#results li:last-child { border-bottom: 0; }
+  .type {
+    flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.4px; padding: 2px 6px; border-radius: 999px;
+    background: var(--edge); color: var(--muted);
+  }
+  .type.Artist  { color: #7dd3fc; }
+  .type.Group   { color: #c4b5fd; }
+  .type.Release { color: #fda4af; }
+  .type.Label   { color: #86efac; }
+  .name { flex: 1; overflow-wrap: anywhere; }
+  .degree { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
+
+  #diagnostics {
+    margin: 0; padding: 10px; max-height: 260px; overflow: auto;
+    background: #0d1526; border: 1px solid var(--edge); border-radius: var(--radius);
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #diagnostics .row { display: flex; gap: 8px; padding: 2px 0; }
+  #diagnostics .hit  { color: var(--hit); }
+  #diagnostics .miss { color: var(--miss); }
+  #diagnostics .cached { color: var(--muted); }
+  #diagnostics .filename { flex: 1; overflow-wrap: anywhere; }
+  #diagnostics .meta { flex: none; color: var(--muted); }
+  #diagnostics-summary { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>v2 search — test harness</h1>
+<p class="tagline">
+  Exercises the static sharded index directly: <code>search.js</code> fetches
+  only <code>/search-index/*.json</code>, no <code>/api/*</code>, no
+  <code>server.py</code> query involved. Not linked from the real viewer.
+</p>
+<p id="manifest-line">Loading manifest…</p>
+
+<input id="q" type="search" placeholder="Type an artist, group, release or label name…" autocomplete="off" autofocus>
+
+<h2>Results</h2>
+<ul id="results"></ul>
+<p id="empty">Start typing.</p>
+
+<h2>Shard fetches this query</h2>
+<pre id="diagnostics"></pre>
+<p id="diagnostics-summary"></p>
+
+<script type="module">
+import { search, loadManifest } from "./search.js";
+
+const $q = document.getElementById("q");
+const $results = document.getElementById("results");
+const $empty = document.getElementById("empty");
+const $diagnostics = document.getElementById("diagnostics");
+const $diagnosticsSummary = document.getElementById("diagnostics-summary");
+const $manifestLine = document.getElementById("manifest-line");
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+loadManifest().then((m) => {
+  $manifestLine.textContent =
+    `${m.total_rows.toLocaleString()} rows across ${m.shard_count.toLocaleString()} shards `
+    + `(built from ${m.generated_from}, max ${m.max_shard_rows} rows/shard, `
+    + `max prefix length ${m.max_prefix_len})`;
+}).catch((err) => {
+  $manifestLine.textContent = "Couldn't load manifest.json: " + err.message;
+  $manifestLine.classList.add("error");
+});
+
+function renderResults(matches) {
+  $empty.hidden = matches.length > 0;
+  $results.innerHTML = matches.map((m) => `
+    <li>
+      <span class="type ${esc(m.type)}">${esc(m.type)}</span>
+      <span class="name">${esc(m.name)}</span>
+      <span class="degree">${m.degree.toLocaleString()}</span>
+    </li>
+  `).join("");
+}
+
+function renderDiagnostics(fetches, key, shardsHit) {
+  if (!fetches.length) {
+    $diagnostics.textContent = key ? "(no shard requests -- not enough typed yet)" : "";
+    $diagnosticsSummary.textContent = "";
+    return;
+  }
+  $diagnostics.innerHTML = fetches.map((f) => {
+    const cls = f.cached ? "cached" : (f.status === 404 ? "miss" : "hit");
+    const label = f.cached ? "cache" : (f.status === 404 ? "404" : "200");
+    const meta = f.cached
+      ? "(already fetched)"
+      : f.status === 404
+        ? `${f.ms.toFixed(0)}ms`
+        : `${f.ms.toFixed(0)}ms, ${f.rows} rows${f.bytes ? `, ${(f.bytes / 1024).toFixed(1)}KB` : ""}`;
+    return `<div class="row ${cls}">`
+         + `<span class="filename">${esc(f.filename)} [${label}]</span>`
+         + `<span class="meta">${esc(meta)}</span>`
+         + `</div>`;
+  }).join("");
+  const hits = fetches.filter((f) => f.status === 200).length;
+  const misses = fetches.filter((f) => f.status === 404).length;
+  const cached = fetches.filter((f) => f.cached).length;
+  // More than one shard contributing is the expected, not exceptional,
+  // case -- see search.js's findShards docstring: an exact-length name
+  // (e.g. a real "BJ") and a longer one sharing its prefix (e.g. "Björk")
+  // can legitimately live in different sibling files along the same path.
+  $diagnosticsSummary.textContent =
+    `${fetches.length} request(s): ${hits} hit, ${misses} miss (404), ${cached} served from cache`
+    + (shardsHit.length ? ` — matches drawn from: ${shardsHit.map((p) => `"${p}"`).join(", ")}` : "");
+}
+
+// Same stale-response-discard shape as app.js's suggestToken: a slow
+// response for an earlier keystroke must not clobber a faster one for a
+// later keystroke.
+let queryToken = 0;
+let debounceTimer = null;
+
+function runSearch(text) {
+  const token = ++queryToken;
+  search(text).then(({ key, matches, shardsHit, fetches }) => {
+    if (token !== queryToken) return; // superseded by a newer query
+    renderResults(matches);
+    renderDiagnostics(fetches, key, shardsHit);
+  }).catch((err) => {
+    if (token !== queryToken) return;
+    $diagnostics.textContent = "Error: " + err.message;
+    $diagnosticsSummary.textContent = "";
+  });
+}
+
+$q.addEventListener("input", () => {
+  const text = $q.value;
+  clearTimeout(debounceTimer);
+  if (!text.trim()) {
+    queryToken += 1; // discard any in-flight response
+    renderResults([]);
+    renderDiagnostics([], "", []);
+    return;
+  }
+  debounceTimer = setTimeout(() => runSearch(text), 180);
+});
+</script>
+</body>
+</html>

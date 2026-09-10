@@ -624,6 +624,18 @@ class Handler(SimpleHTTPRequestHandler):
             self.path = "/logs.html"
             return super().do_GET()
 
+        # /v2/search is the test harness for the static sharded search index
+        # (web/v2/search.js + search.html; see
+        # notes/static-search-downsize-2026-08-19.md). Deliberately not
+        # linked from index.html -- it talks only to /search-index/*.json,
+        # never to /api/*, and isn't part of the real viewer. The shard
+        # files themselves need no route of their own: they're ordinary
+        # static files under web/search-index/, served by the same
+        # super().do_GET() fallthrough as app.js or styles.css.
+        if parsed.path in ("/v2/search", "/v2/search/"):
+            self.path = "/v2/search.html"
+            return super().do_GET()
+
         if not parsed.path.startswith("/api/"):
             return super().do_GET()
 

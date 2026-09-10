@@ -31,23 +31,29 @@ section). Each final shard is written as compact JSON: an array of
 [type, id, name, degree] rows, not objects -- no repeated key names against
 15M rows.
 
-No manifest lists where each shard lives, deliberately. A shard's filename
-*is* its (URL-encoded) prefix -- see shard_filename -- so the browser needs
-no lookup at all: try "<encode(typed[:2])>.json"; a 404 means that prefix
-was too big to ship whole and got split deeper, so wait for a 3rd character
-and try "<encode(typed[:3])>.json", and so on. An earlier version generated
-a manifest.json listing every shard's prefix/file/count, meant to be the
-thing the browser consulted to find the right file -- it came out at
-12-18MB, bigger than any shard it was meant to help find, i.e. exactly the
-whole-corpus-sized fetch sharding was meant to avoid. manifest.json still
-gets written, but only as build metadata (row/shard counts, the params
-used) -- nothing in it is needed at request time.
+No manifest lists where each shard lives, deliberately. A shard's on-disk
+filename *is* its own (raw, unencoded) prefix -- see shard_filename -- so
+the browser needs no lookup at all: percent-encode typed[:2] for the URL
+and try "<encoded>.json"; a 404 means that prefix was too big to ship whole
+and got split deeper, so wait for a 3rd character and try again one
+character longer. The absence of a file *is* the "look deeper" signal. An
+earlier version generated a manifest.json listing every shard's
+prefix/file/count, meant to be the thing the browser consulted to find the
+right file -- it came out at 12-18MB, bigger than any shard it was meant to
+help find, i.e. exactly the whole-corpus-sized fetch sharding was meant to
+avoid. manifest.json still gets written, but only as build metadata
+(row/shard counts, the params used) -- nothing in it is needed at request
+time.
 
     python shard_search_index.py search_index_export.csv.gz -o web/search-index
 
-Not wired into app.js yet -- this only produces the on-disk shards. Whatever
-fetch code lands there needs to reproduce shard_filename's encoding exactly
-(see its docstring) -- encodeURIComponent alone is not a safe substitute.
+Test harness: web/v2/search.js + search.html, served at /v2/search (see
+server.py). Its shardFilename() has to reproduce shard_filename's
+SLASH_SUBSTITUTE swap and percent-encoding exactly, and percent-encoding
+belongs *only* in the URL it builds, never in a filename written to disk --
+see shard_filename's docstring for why conflating the two silently broke
+61% of shards on the first real build, caught only by fetching one through
+the live server, not by unit-testing the encoder alone.
 """
 
 import argparse
@@ -60,7 +66,6 @@ import shutil
 import sys
 import unicodedata
 from collections import defaultdict
-from urllib.parse import quote
 
 from progress import Heartbeat
 
@@ -90,26 +95,54 @@ def open_input(path):
     return open(path, "r", newline="", encoding="utf-8")
 
 
+# "/" is the one character that can never survive as part of a single
+# on-disk filename no matter how it's escaped -- see shard_filename's
+# docstring for why. Real prefixes do contain it ("AC/DC"), so it's
+# substituted for this character instead of being left to break the build.
+#
+# U+E000, the first Private Use Area codepoint -- not U+2044 FRACTION
+# SLASH, which the first attempt at this used and which real names
+# collided with on the first real run ('duplicate shard filename:
+# "⁄h.json"'): NFKD decomposition -- which normalise() applies *before*
+# this substitution ever runs -- expands a vulgar fraction like "½" into
+# "1⁄2", i.e. digits either side of U+2044 itself, so that "distinct"
+# codepoint was already reachable from ordinary text and wasn't distinct
+# at all. A PUA codepoint has no decomposition and no defined meaning
+# outside a specific font/application, so genuine Discogs text can't
+# produce one by any route -- decomposition included -- the way it turned
+# out to be able to produce the previous choice.
+SLASH_SUBSTITUTE = ""
+
+
 def shard_filename(prefix):
     """
-    URL-safe filename for a shard, named by its own prefix rather than a
-    sequential index -- so the client can compute the fetch path directly
-    from what's been typed, with no lookup file of any kind: try
-    "<encode(typed[:2])>.json"; a 404 means that prefix was too big to ship
-    whole and got split deeper (see split_bucket), so wait for a 3rd
-    character and try "<encode(typed[:3])>.json", and so on. The absence of
-    a file *is* the "look deeper" signal -- no manifest, no redirect stub.
+    Raw on-disk filename for a shard, named by its own (normalised, "/"
+    -substituted) prefix rather than a sequential index -- so the client
+    can compute the fetch path directly from what's been typed, with no
+    lookup file of any kind: try "<encode(typed[:2])>.json"; a 404 means
+    that prefix was too big to ship whole and got split deeper (see
+    split_bucket), so wait for a 3rd character and try
+    "<encode(typed[:3])>.json", and so on. The absence of a file *is* the
+    "look deeper" signal -- no manifest, no redirect stub.
 
-    The encoding matters more than it looks: it has to be reproduced
-    *exactly* by whatever fetch code app.js eventually gets, or a mismatch
-    would look identical to a genuine miss. JS's built-in
-    encodeURIComponent is NOT safe to pair with this -- it leaves
-    `! * ' ( )` unescaped while urllib.parse.quote does not, and prefixes
-    can genuinely start with those (e.g. the real Discogs artist
-    "(hed) Planet Earth"). Whatever client code lands later must use a
-    matching encoder, not encodeURIComponent directly.
+    Deliberately NOT percent-encoded, unlike an earlier version of this
+    function -- and that earlier version was wrong in a way unit-testing
+    the encoder in isolation didn't catch, only fetching a real shard
+    through the live server did. http.server's SimpleHTTPRequestHandler
+    (translate_path) unquotes a request's *entire* path before splitting
+    it into filesystem components, so a client fetching this shard by its
+    properly percent-encoded URL arrives here already decoded back to
+    these literal characters. Writing the file under its *encoded* name
+    instead meant the two could never match for any prefix containing a
+    character outside [A-Za-z0-9_.-~] -- on the 2026-09 build that was
+    127,261 of 207,225 shards (61%): every prefix with a space, and
+    anything in a non-Latin script. search.js's shardFilename() has to
+    apply the same SLASH_SUBSTITUTE swap before it percent-encodes for the
+    URL, or a prefix containing "/" would look for a shard under the wrong
+    name; everything else it encodes is exactly what makes it back here
+    once the server decodes the request.
     """
-    return quote(prefix, safe="") + ".json"
+    return prefix.replace("/", SLASH_SUBSTITUTE) + ".json"
 
 
 def partition_key(prefix, n_partitions):
