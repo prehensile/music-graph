@@ -242,6 +242,25 @@ with room to spare.
    almost certainly fine — no incremental/delta update mechanism is
    proposed here, and none looks necessary at this scale.
 
+## Decision: shard, don't build a Range-request binary index
+
+A single sorted binary blob plus a small `(id, offset, length)` index,
+resolved by binary-searching the index itself via HTTP Range requests,
+was considered as an alternative to sharding — it keeps something closer
+to "one id, one direct fetch," which sharding gives up (a fetch returns a
+bucket of ~1000+ nodes, not just the one asked for). Rejected for now:
+it needs the eventual static host to honour `Range` requests (true for
+S3/CloudFront and Cloudflare, patchier elsewhere — not yet verified
+against whichever host actually gets picked), and it's new engineering
+with no working precedent in this repo, unlike sharding, which
+`shard_search_index.py` has already had its real bugs (the
+filename/URL-encoding split, the single-vs-plural shard fetch) found and
+fixed against the live dump. Priority here is "it works," not
+architectural cleanliness — sharding is the proven path, so that's what
+this plan commits to. Revisit only if the shard-bundle granularity (a
+fetch always pulling in a node's ~1000 bucket-mates, not just itself)
+turns out to matter in practice.
+
 ## Feasibility
 
 Most of the hard-won engineering this would need has already been done
