@@ -196,9 +196,15 @@ async function findShards(key, onFetch) {
  * Search the sharded index for `text`. Resolves to:
  *   { key, matches, shardsHit, fetches }
  * - key: the normalised query actually searched for.
- * - matches: [{ type, id, name, degree }], sorted by degree descending
- *   (same "well-connected first" tie-break server.py's _rank_matches uses),
- *   capped at `limit`.
+ * - matches: [{ type, id, name, degree, artists, date }], sorted by degree
+ *   descending (same "well-connected first" tie-break server.py's
+ *   _rank_matches uses), capped at `limit`. artists and date are "" for
+ *   everything except Release -- without artists there's no way to tell
+ *   e.g. the several dozen different releases all titled "Timeless" apart
+ *   in a result list (see export_search_index.py's RELEASE_ARTIST_CAP and
+ *   its Group-over-Artist-credit preference for how the shown name(s) are
+ *   chosen); date is passed through from Discogs' <released> verbatim, not
+ *   reformatted.
  * - shardsHit: the prefixes of every shard file that actually contributed
  *   rows -- usually one, but see findShards for why a query can
  *   legitimately need more than one shard merged together.
@@ -230,7 +236,9 @@ export async function search(text, { limit = 50 } = {}) {
     .filter((row) => normalise(row[2]).startsWith(key))
     .sort((a, b) => (b[3] || 0) - (a[3] || 0))
     .slice(0, limit)
-    .map(([code, id, name, degree]) => ({ type: types[code] || code, id, name, degree }));
+    .map(([code, id, name, degree, artists, date]) => (
+      { type: types[code] || code, id, name, degree, artists, date }
+    ));
 
   return { key, matches, shardsHit: hits.map((h) => h.prefix), fetches };
 }

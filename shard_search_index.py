@@ -28,8 +28,11 @@ common prefix like "the" (564,631 rows on the 2026-08 dump, well past any
 sane single fetch, and that's real name distribution, not the "Not On
 Label" placeholder skew fixed elsewhere -- see CLAUDE.md's Data Model
 section). Each final shard is written as compact JSON: an array of
-[type, id, name, degree] rows, not objects -- no repeated key names against
-15M rows.
+[type, id, name, degree, extra] rows, not objects -- no repeated key names
+against 15M rows. extra is "" for everything except Release, where it's
+up to a few credited artist names (see export_search_index.py's
+RELEASE_ARTIST_CAP) -- without it, e.g. the several dozen different
+releases all titled "Timeless" are indistinguishable in a result list.
 
 No manifest lists where each shard lives, deliberately. A shard's on-disk
 filename *is* its own (raw, unencoded) prefix -- see shard_filename -- so
@@ -168,9 +171,9 @@ def partition(input_path, work_dir, n_partitions):
         with open_input(input_path) as fh:
             reader = csv.reader(fh)
             header = next(reader)
-            assert header == ["type", "id", "name", "degree"], f"unexpected header: {header}"
+            assert header == ["type", "id", "name", "degree", "artists", "date"], f"unexpected header: {header}"
             for row in reader:
-                type_, id_, name, degree = row
+                type_, id_, name, degree, artists, date = row
                 code = TYPE_CODES.get(type_)
                 if code is None:
                     skipped += 1
@@ -178,7 +181,7 @@ def partition(input_path, work_dir, n_partitions):
                 key = normalise(name)
                 prefix = key[:PREFIX_LEN]
                 fh_out = handles[partition_key(prefix, n_partitions)]
-                fh_out.write(json.dumps([prefix, code, id_, name, int(degree)]) + "\n")
+                fh_out.write(json.dumps([prefix, code, id_, name, int(degree), artists, date]) + "\n")
                 written += 1
                 hb.tick(written)
     finally:
@@ -236,13 +239,13 @@ def finalise(work_dir, output_dir, n_partitions, max_shard_rows, max_prefix_len,
     for i in range(n_partitions):
         part_path = os.path.join(work_dir, f"part_{i:04d}.jsonl")
         # bucket[normalised_2char_prefix] -> list of
-        # [normalised_key, type_code, id, name, degree]
+        # [normalised_key, type_code, id, name, degree, artists, date]
         buckets = defaultdict(list)
         with open(part_path, "r", encoding="utf-8") as fh:
             for line in fh:
-                prefix, code, id_, name, degree = json.loads(line)
+                prefix, code, id_, name, degree, artists, date = json.loads(line)
                 key = normalise(name)  # full key, not just the 2-char prefix
-                buckets[prefix].append([key, code, id_, name, degree])
+                buckets[prefix].append([key, code, id_, name, degree, artists, date])
 
         for prefix, rows in buckets.items():
             leaves = []
@@ -252,8 +255,13 @@ def finalise(work_dir, output_dir, n_partitions, max_shard_rows, max_prefix_len,
                 assert filename not in written_files, f"duplicate shard filename: {filename!r}"
                 written_files.add(filename)
                 # Drop the normalised key before writing -- it was only
-                # needed to decide which shard a row belongs in.
-                compact = [[code, id_, name, degree] for _, code, id_, name, degree in leaf_rows]
+                # needed to decide which shard a row belongs in. artists
+                # and date are "" for everything except Release (see
+                # export_search_index.py) -- kept as empty strings, not
+                # omitted, so every row is still a fixed-length
+                # [type, id, name, degree, artists, date] tuple client-side.
+                compact = [[code, id_, name, degree, artists, date]
+                           for _, code, id_, name, degree, artists, date in leaf_rows]
                 with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as out:
                     json.dump(compact, out, separators=(",", ":"), ensure_ascii=False)
                 shard_count += 1

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Export a flat (type, id, name, degree) CSV straight from Neo4j, for building
-a static search index once the intermediate CSVs are gone.
+Export a flat (type, id, name, degree, artists, date) CSV straight from
+Neo4j, for building a static search index once the intermediate CSVs are
+gone.
 
 Filed alongside notes/static-search-downsize-2026-08-19.md: the plan there
 needs id+name for every node, and the pipeline's own artists.csv/groups.csv/
@@ -40,6 +41,69 @@ node at export time -- there is no shortcut via the count store for
 per-node degree, only label totals -- so this export is slower than a plain
 id+name pull would be.
 
+`artists` and `date` are both empty for Artist/Group/Label; both are
+Release-only, and exist for the same reason: a Release's own title alone
+can't tell two same-titled releases apart (there are, unsurprisingly,
+several dozen different releases called "Timeless" by different artists
+in different years), and the static search index has no other way to show
+that, since it carries no relationship data at all otherwise. This is a
+*display* fix, not a search/ranking one -- it doesn't help a query find
+the right "Timeless", only helps a human reading the results tell them
+apart once found. The actual cross-relationship ranking problem
+(server.py's _rank_matches neighbour-boost) is unrelated and still has no
+client-side answer -- see notes/static-search-downsize-2026-08-19.md.
+
+`date` is `n.year` verbatim -- misleadingly named on the Release node
+itself (see CLAUDE.md's "Fixed along the way" for the unrelated labels.csv
+header bug this project already hit once from trusting a property name
+over its actual content): it holds whatever `<released>` contained in the
+XML, which is usually a full date ("2023-12-28") and only sometimes just a
+year, not "the year" as a parsed/typed value. Passed through as-is; no
+parsing or reformatting attempted here.
+
+`artists` is up to RELEASE_ARTIST_CAP credited names, semicolon-joined --
+not Discogs' own credit order, which the graph has no way to reconstruct
+(`CREDITED` carries no property distinguishing Discogs' <artists>, the
+headline credit, from <extraartists>, session/production credits; both
+write to the same relationship type in discogs_to_neo4j.py's
+process_release, so that distinction was never preserved, and Cypher gives
+no ordering guarantee over OPTIONAL MATCH results to fall back on either).
+Two heuristics stand in for it instead, cheaper and more accurate than
+either alone:
+
+1. **Prefer Group credits over Artist credits, entirely, when any Group is
+   credited.** A release credited to the band Mucc plus ~50 backing/
+   session musicians -- individually Artist nodes, not the Group -- is the
+   motivating, verified case: with every credited node in one undifferentiated
+   pool, arbitrary collect() order surfaced "Yoshio Arimatsu; Jun-ichi
+   Yajima; ..." (session players) instead of "Mucc" (the actual band).
+   Filtering to Group-labelled credits whenever at least one exists (via
+   `EXISTS { (n)<-[:CREDITED]-(:Group) }`, computed once per release, not
+   once per candidate) fixes this directly for the common "a band's own
+   release, credited alongside its session players" shape, without needing
+   any per-candidate degree computation for the (usually many) session
+   artists at all -- they're filtered out before COUNT{} ever runs on them.
+2. **Within whichever pool that leaves (Group credits if any, else every
+   Artist credit), sort by degree descending.** Handles releases with more
+   than one Group credited, and every release with no Group credit at all
+   (the majority -- most releases are solo/duo, not band releases),
+   falling back to "most well-connected first" exactly as `_rank_matches`'
+   own tie-break does in server.py.
+
+Both are heuristics, not a real fix -- a genuine one needs `CREDITED` (or a
+new relationship) to carry which XML block a credit came from, which is a
+discogs_to_neo4j.py + live-migration change, not a search-index one. But
+filtering to Group credits first also happens to be the cheaper query:
+measured on the 2026-08 dump, computing degree for every CREDITED edge
+unconditionally ran at ~1,062 releases/s (would be ~40 minutes for the
+Release pass alone, since ~13.7M CREDITED edges exist in total and a
+prolific artist's degree got recomputed once per release they're credited
+on); filtering most candidates out via EXISTS before any degree computation
+runs measured at ~3,976 releases/s instead -- most releases never compute a
+single per-candidate degree, since a solo release's one Artist credit still
+needs it, but a large compilation's dozens of session-player Artist credits
+never do once a Group credit is found among them.
+
 Environment matches server.py/graph_stats.py: NEO4J_URI, NEO4J_USERNAME,
 NEO4J_PASSWORD, NEO4J_DATABASE.
 """
@@ -62,6 +126,12 @@ LABEL_PROPS = {
     "Label": ("labelId", "name"),
 }
 
+# Same cap server.py's Graph.suggest uses for the same collect(DISTINCT ...):
+# a handful of names is enough to disambiguate a result, and an unbounded
+# collect against a hub-like Various-Artists-credited release would be
+# needless cost for no display benefit beyond the first few.
+RELEASE_ARTIST_CAP = 3
+
 
 def connect():
     password = os.environ.get("NEO4J_PASSWORD", "")
@@ -83,17 +153,66 @@ def export_label(session, label, writer):
     hb = Heartbeat(label.lower(), total=count(session, label), unit=label.lower())
     hb.begin()
     written = skipped = 0
-    result = session.run(
-        f"MATCH (n:{label}) RETURN n.{id_prop} AS id, n.{name_prop} AS name, "
-        f"COUNT {{ (n)--() }} AS degree"
-    )
+
+    if label == "Release":
+        # OPTIONAL, not MATCH: a release with no CREDITED artist at all
+        # (referential drift -- see CLAUDE.md's Known Issues -- or a
+        # release whose only credit was a placeholder id filtered out of
+        # CREDITED at import) must still flow through with artists="",
+        # not drop out of the export entirely.
+        #
+        # hasGroup is computed once per release, before the candidate
+        # OPTIONAL MATCH runs -- not re-evaluated per candidate row, which
+        # an EXISTS{} inside the later WHERE would do instead, once per
+        # credited node rather than once per release. The WHERE below then
+        # keeps only Group candidates when any exist, else every Artist
+        # candidate (or the OPTIONAL MATCH's own null placeholder, when a
+        # release has no CREDITED node of either kind at all -- hasGroup is
+        # false in that case too, so `hasGroup = (cand:Group)` evaluates to
+        # `false = null` = null there, which WHERE treats as "exclude", so
+        # that placeholder row never reaches the collect() below; the
+        # explicit `cand IS NULL OR` keeps it anyway, matching the CASE
+        # WHEN cand IS NOT NULL guard the collect() itself still needs for
+        # COUNT{} and property access, both to be avoided on a null node
+        # rather than relied on to silently do the right thing).
+        query = (
+            f"MATCH (n:{label}) "
+            f"WITH n, EXISTS {{ (n)<-[:CREDITED]-(:Group) }} AS hasGroup "
+            f"OPTIONAL MATCH (n)<-[:CREDITED]-(cand) "
+            f"WHERE cand IS NULL OR hasGroup = (cand:Group) "
+            f"WITH n, collect(DISTINCT "
+            f"CASE WHEN cand IS NOT NULL THEN {{name: cand.name, degree: COUNT {{ (cand)--() }} }} END"
+            f") AS candInfo "
+            f"RETURN n.{id_prop} AS id, n.{name_prop} AS name, candInfo, n.year AS date, "
+            f"COUNT {{ (n)--() }} AS degree"
+        )
+    else:
+        query = (
+            f"MATCH (n:{label}) RETURN n.{id_prop} AS id, n.{name_prop} AS name, "
+            f"COUNT {{ (n)--() }} AS degree"
+        )
+
+    result = session.run(query)
     for record in result:  # streamed from the Bolt connection, not buffered
         node_id, name, degree = record["id"], record["name"], record["degree"]
         if not name or not name.strip():
             skipped += 1
             hb.tick(written + skipped)
             continue
-        writer.writerow((label, node_id, name, degree))
+        if label == "Release":
+            # None entries come from releases with zero CREDITED nodes of
+            # either kind (the CASE WHEN in the query above), filtered
+            # here rather than in Cypher -- simpler than threading another
+            # WHERE through an already-nested WITH chain.
+            candidates = sorted(
+                (c for c in record["candInfo"] if c is not None),
+                key=lambda c: c["degree"], reverse=True,
+            )
+            artists = "; ".join(c["name"] for c in candidates[:RELEASE_ARTIST_CAP] if c["name"])
+            date = record["date"] or ""
+        else:
+            artists = date = ""
+        writer.writerow((label, node_id, name, degree, artists, date))
         written += 1
         hb.tick(written + skipped)
     hb.finish(f"{skipped:,} skipped (empty name)")
@@ -127,7 +246,7 @@ def main():
     try:
         with driver.session(database=database) as session, open_output(args.output) as fh:
             writer = csv.writer(fh)
-            writer.writerow(("type", "id", "name", "degree"))
+            writer.writerow(("type", "id", "name", "degree", "artists", "date"))
             for label in labels:
                 written, skipped = export_label(session, label, writer)
                 total_written += written

@@ -67,7 +67,12 @@
   .type.Group   { color: #c4b5fd; }
   .type.Release { color: #fda4af; }
   .type.Label   { color: #86efac; }
-  .name { flex: 1; overflow-wrap: anywhere; }
+  .name-block { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .name { overflow-wrap: anywhere; }
+  .extra {
+    font-size: 12px; color: var(--muted); overflow-wrap: anywhere;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .degree { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   #empty { color: var(--muted); font-size: 13px; padding: 8px 10px; }
 
@@ -132,13 +137,22 @@ loadManifest().then((m) => {
 
 function renderResults(matches) {
   $empty.hidden = matches.length > 0;
-  $results.innerHTML = matches.map((m) => `
+  $results.innerHTML = matches.map((m) => {
+    // Discogs' <released> is usually a full date, sometimes just a year --
+    // shown verbatim either way, not reformatted (see search.js's date
+    // field docs).
+    const subtitle = [m.artists, m.date].filter(Boolean).join(" — ");
+    return `
     <li>
       <span class="type ${esc(m.type)}">${esc(m.type)}</span>
-      <span class="name">${esc(m.name)}</span>
+      <span class="name-block">
+        <span class="name">${esc(m.name)}</span>
+        ${subtitle ? `<span class="extra">${esc(subtitle)}</span>` : ""}
+      </span>
       <span class="degree">${m.degree.toLocaleString()}</span>
     </li>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function renderDiagnostics(fetches, key, shardsHit) {
