@@ -181,20 +181,50 @@ building it:
 | Relationship rows (sum of the 5 types, per CLAUDE.md's measured counts) | ~19–20M, ~40M directed adjacency entries |
 | Per-node base fields | same order as `search_index_export.csv.gz`: ~36 bytes/row uncompressed for `type,id,name,degree` alone: 543 MB / 15.16M rows |
 | Per-edge entry, compact JSON (`[code,dir,code,id]`) | ~20–25 bytes |
-| **Rough total, uncompressed** | **~1.5–2 GB**, i.e. the same order as the existing `search_index_export.csv.gz` (543 MB) plus the edge list on top |
+| **Average per-node record (base fields + ~2.6 edges)** | **~110 bytes** |
+| **Rough total, uncompressed** | **~1.7 GB**, i.e. the same order as the existing `search_index_export.csv.gz` (543 MB) plus the edge list on top |
 | Compressed (host gzip/brotli, free per the search-index note) | roughly a third to a half of that |
 
 Never fetched all at once — same as the search shards, a viewer session
 touches a handful of shard files per tap, not the corpus — so total
 corpus size mostly matters for build time and storage, not any one
-user's transfer. **Shard count**: sized the same way `--partitions`/
-`--max-shard-rows` were tuned for search (`shard_search_index.py`'s real
-run needed its defaults raised once actual skew was measured — expect
-the same here), aiming for shards in the tens-of-KB range, i.e. low
-thousands of nodes per shard against ~15M nodes → on the order of a few
-thousand shard files. Comfortably clear of every problem in the "millions
-of files" section above, and clear of Cloudflare Pages' 20,000-file cap
-with room to spare.
+user's transfer.
+
+**Shard count is a direct knob here, unlike the search shards.** The
+search index's ~210,860 shards *emerged* from real name-prefix skew
+(`split_bucket` recursing until each bucket fit under `--max-shard-rows`)
+— nobody chose that number, the data did. Id-hash buckets are uniform by
+construction, so shard count directly sets average shard size:
+
+| Shard count | Nodes/shard | Size (raw) | Size (gzip) |
+|---|---|---|---|
+| 1,000 | ~15,160 | ~1.7 MB | ~620 KB |
+| 2,000 | ~7,580 | ~835 KB | ~310 KB |
+| 5,000 | ~3,030 | ~335 KB | ~125 KB |
+| 10,000 | ~1,516 | ~167 KB | ~62 KB |
+| 20,000 | ~758 | ~84 KB | ~31 KB |
+| 50,000 | ~303 | ~33 KB | ~12 KB |
+
+**~5,000–10,000 shards** (60–125 KB compressed each) looks like the
+right target: one request per expand-tap, small enough to feel instant,
+comfortably clear of every problem in the "millions of files" section
+above and of Cloudflare Pages' 20,000-file cap with room to spare.
+Note this *contradicts* an earlier draft of this estimate, which aimed
+for "tens of KB, a few thousand files" — those two targets can't both
+hold here. The search shards only got both at once because real skew
+did the splitting; forcing id-hash shards down to tens of KB would need
+tens of thousands of them (the table's bottom rows), which starts
+crowding the file-count ceiling this design exists to avoid. Bigger,
+fewer shards is the actual trade at this node count, not smaller-is-
+always-better.
+
+This is all arithmetic on the real, measured node-side numbers
+(`search_index_export.csv.gz`) applied to an *estimated* edge count —
+no edge export exists yet to check it against, so treat the table as a
+planning-stage estimate to be corrected once the real export runs, the
+same way the search shards' own defaults only got fixed after a real
+build surfaced actual skew (the "not on" bucket, see the search-downsize
+note's 2026-09-07 update).
 
 ## What doesn't need to change
 
