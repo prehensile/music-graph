@@ -291,6 +291,102 @@ this plan commits to. Revisit only if the shard-bundle granularity (a
 fetch always pulling in a node's ~1000 bucket-mates, not just itself)
 turns out to matter in practice.
 
+## Considered: clustering-aware sharding via synthetic ids
+
+Id-hash sharding scatters a node's neighbours uniformly at random across
+shards. Gut feel says this is wasteful for the dominant access pattern —
+search for one thing, then tap around its neighbourhood — since a
+tightly-connected neighbourhood (e.g. a band and its members) could in
+principle live in one shard and cost one fetch instead of several.
+
+**Plain community clustering doesn't work within this plan's own rules.**
+Grouping nodes by a graph community-detection algorithm (Louvain, label
+propagation) and shipping shards along community lines would need an
+id → shard lookup at request time, because community membership isn't a
+pure function of a node's id the way a hash bucket is — it's the output
+of a global algorithm over the whole graph. That lookup is a manifest by
+another name, exactly the thing already rejected twice over (the
+Range-request index above, and `shard_search_index.py`'s own abandoned
+12–18MB manifest.json for search).
+
+**The fix: don't keep Discogs ids as the shard key at all.** Run
+community detection once, offline, at build time (a batch job — hours
+are fine, same tolerance the rest of the monthly rebuild already has),
+then assign each node a *synthetic* id sequentially within its cluster,
+so cluster membership is baked into the id's numeric range rather than
+needing a lookup: `shard = synthetic_id // shard_size`. This keeps the
+core property that made id-hash shards viable — the client computes a
+fetch path from an id alone — while making the id itself
+locality-aware. An oversized cluster just spans several consecutive
+shard files, the same recursive-split treatment `split_bucket` already
+gives an oversized name-prefix bucket, applied to cluster size instead.
+
+The dominant path (search → explore) needs no extra lookup at all: the
+search shards are already rebuilt from scratch every cycle, so they can
+simply carry the synthetic id directly — a typed query resolves straight
+to a fetchable shard id. The one remaining gap is profile-text
+references (`[a123456]`), which embed a *raw* Discogs id verbatim inside
+bio text shipped from the dump and can't be rewritten — clicking one
+needs a Discogs-id → synthetic-id translation. That's already the
+lowest-value, highest-miss-rate path in the app (`/api/resolve` "returns
+404 far more often than the other endpoints resolve cleanly" per
+CLAUDE.md), and it doesn't need anything novel either: a second,
+ordinary id-hash-sharded translation index, same proven mechanism as
+everything else, just keyed on the Discogs id instead of the synthetic
+one. Rough size, ~15.16M rows × ~9 bytes ≈ 135MB raw — same order as
+everything else already budgeted, fetched only on that rare click path.
+
+**This resolves the addressing objection but doesn't overturn the
+earlier verdict on how much it actually buys.** Hub scatter is
+structural, not a sharding artifact: a release's *other* credits, or a
+label's other signings, fan out across the graph regardless of how well
+clustered the immediate neighbourhood is — that's what makes a node a
+hub, and it's exactly what `_neighbours`' per-type budget caps already
+exist to bound. And shards fetched concurrently over HTTP/2 to one host
+cost close to one round trip's worth of wall-clock time regardless of
+count, so the latency case for clustering is weaker than intuition
+suggests — its real payoff is fewer distinct requests, not a faster feel.
+
+**Motivation, and why it's host-dependent — checked against current
+pricing, not assumed:**
+
+1. **Efficiency** — real regardless of host: fewer distinct shard
+   fetches per session is less client-side work and less data moved,
+   full stop.
+2. **Per-request billing** — this turned out to hinge entirely on which
+   static host ends up serving the shards, checked against current docs
+   rather than memory:
+   - **Cloudflare R2** (object storage): egress is free, but *reads* are
+     metered as "Class B operations" — $0.36 per million requests, 10M/
+     month free ([pricing](https://developers.cloudflare.com/r2/pricing/)).
+     The opposite of "charges per MB" — it's request-metered, MB-free.
+   - **Cloudflare Pages** (the more natural fit for a pure static site,
+     and what this whole plan otherwise points at): **no per-request or
+     per-bandwidth charge at all**, free or paid tier — "static asset
+     bandwidth is unmetered on every plan... requests to static assets
+     are free and unlimited" so long as nothing dynamic (Functions/
+     Workers) sits in the path. Its real constraint is a **file-count
+     cap per deployment** instead: 20,000 free, 100,000 paid
+     ([limits](https://developers.cloudflare.com/pages/platform/limits/)).
+     At the 5,000–10,000-shard target from the sizing section above,
+     that cap isn't close to binding, clustered or not.
+
+So motivation (2) is real only if R2 (or an equivalently request-metered
+host) is where this ends up — and even there, 10M free reads/month is
+roughly 333k/day before any cost accrues, a lot of headroom for a
+personal project. On Pages, there's no billing reason to cluster at all,
+only the (weaker, per above) UX one.
+
+**Not decided yet, deliberately**: which host this deploys to. Both
+motivations are recorded as real, with (2) explicitly conditional on
+that still-open choice, rather than resolving it now. Revisit once a
+host is picked or real traffic/cost data exists to weigh against the
+extra build complexity (a GDS or equivalent clustering pass, contiguous
+per-cluster id assignment, the oversized-cluster split logic, the
+narrow Discogs-id translation index) — plain id-hash sharding remains
+the first build regardless, since it's simpler and this only sharpens
+which optimisation to reach for next, not whether to ship at all.
+
 ## Feasibility
 
 Most of the hard-won engineering this would need has already been done
